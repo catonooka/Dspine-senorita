@@ -67,13 +67,27 @@ def build_generator(lane, dynamic, conf):
     return gen, tokenizer
 
 
-def chat_prompt(messages, embeddings=None):
-    """Qwen chat template; image aliases (text_alias) spliced before the text."""
+EFFORT_INSTRUCTIONS = {
+    "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+             "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+             "clarity in the final answer.",
+    "low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+           "conclusion without unnecessary elaboration.",
+    "medium": "",
+}
+
+
+def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effort="xhigh"):
+    """Qwen chat template; image aliases spliced before text; effort + thinking per template."""
     aliases = [e.text_alias for e in (embeddings or [])]
+    eff = EFFORT_INSTRUCTIONS.get(reasoning_effort, "")
     parts = []
     sysmsg = [m["content"] for m in messages if m.get("role") == "system"]
     if sysmsg:
-        parts.append(f"<|im_start|>system\n{sysmsg[0]}<|im_end|>\n")
+        sys = sysmsg[0] + ("\n\n" + eff if eff else "")
+        parts.append(f"<|im_start|>system\n{sys}<|im_end|>\n")
+    elif eff:
+        parts.append(f"<|im_start|>system\n{eff}<|im_end|>\n")
     first_user = True
     for m in messages:
         if m.get("role") == "system":
@@ -85,6 +99,8 @@ def chat_prompt(messages, embeddings=None):
             first_user = False
         parts.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
+    if not enable_thinking:
+        parts.append("<think>\n\n</think>\n\n")  # exact template off-switch
     return "".join(parts)
 
 
@@ -154,11 +170,12 @@ class Server:
 
     # ---------- generation ----------
 
-    def generate(self, messages, max_tokens, temperature=0.0):
+    def generate(self, messages, max_tokens, temperature=0.0,
+                 enable_thinking=True, reasoning_effort="xhigh"):
         """Full generation, returns (text, tps, n_tokens)."""
         messages, img_urls = self.extract_images(messages)
         embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings)
+        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
@@ -166,22 +183,23 @@ class Server:
                   stop_conditions=self.eos, embeddings=embeddings or None)
         with self.lock:
             self.gen.enqueue(job)
-            out, t0 = "", None
+            out, t0, t_start = "", None, time.time()
             while self.gen.num_remaining_jobs():
                 results = self.gen.iterate()
                 if t0 is None and out:
                     t0 = time.time()
                 for r in results:
                     out += r.get("text", "")
-            dt = max(1e-6, time.time() - t0)
+            dt = max(1e-6, time.time() - (t0 if t0 is not None else t_start))
         n = len(self.tokenizer.encode(out, encode_special_tokens=True).flatten())
         return out, n / dt, n
 
-    def generate_stream(self, messages, max_tokens, temperature=0.0, emit=None):
+    def generate_stream(self, messages, max_tokens, temperature=0.0, emit=None,
+                        enable_thinking=True, reasoning_effort="xhigh"):
         """Streaming generation; emit(text_delta) called per chunk. Returns stats."""
         messages, img_urls = self.extract_images(messages)
         embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings)
+        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
@@ -189,7 +207,7 @@ class Server:
                   stop_conditions=self.eos, embeddings=embeddings or None)
         with self.lock:
             self.gen.enqueue(job)
-            out, t0 = "", None
+            out, t0, t_start = "", None, time.time()
             while self.gen.num_remaining_jobs():
                 results = self.gen.iterate()
                 if t0 is None and out:
@@ -199,7 +217,7 @@ class Server:
                     if d and emit:
                         emit(d)
                     out += d
-            dt = max(1e-6, time.time() - t0)
+            dt = max(1e-6, time.time() - (t0 if t0 is not None else t_start))
         n = len(self.tokenizer.encode(out, encode_special_tokens=True).flatten())
         return out, n / dt, n
 
@@ -248,6 +266,17 @@ class Handler(BaseHTTPRequestHandler):
         temperature = float(req.get("temperature") or 0.0)
         temperature = 0.0 if temperature < 1e-4 else temperature
         stream = bool(req.get("stream"))
+        # thinking controls: OpenAI-style reasoning_effort/enable_thinking +
+        # z.ai-style thinking.type parity
+        reasoning_effort = req.get("reasoning_effort") or "xhigh"
+        if reasoning_effort not in ("xhigh", "medium", "low"):
+            self._json(400, {"error": f"Unexpected reasoning effort {reasoning_effort}. "
+                                      "Supported types are xhigh (default), medium, and low."})
+            return
+        enable_thinking = req.get("enable_thinking", True)
+        th = req.get("thinking")
+        if isinstance(th, dict) and th.get("type") == "disabled":
+            enable_thinking = False
         model_id = "qwen3.8-27b-exl3-4bpw-prose"
         t0 = time.time()
 
@@ -269,8 +298,10 @@ class Handler(BaseHTTPRequestHandler):
                                   "finish_reason": finish}]})
             try:
                 chunk("")
-                text, tps, n = SRV.generate_stream(messages, max_tokens, temperature,
-                                                   emit=lambda d: chunk(d))
+                text, tps, n = SRV.generate_stream(
+                    messages, max_tokens, temperature,
+                    emit=lambda d: chunk(d),
+                    enable_thinking=enable_thinking, reasoning_effort=reasoning_effort)
                 chunk("", finish="stop")
                 sse({"stats": {"tokens": n, "tps": round(tps, 1),
                                "wall_s": round(time.time() - t0, 2)}})
@@ -278,7 +309,9 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         else:
-            text, tps, n = SRV.generate(messages, max_tokens, temperature)
+            text, tps, n = SRV.generate(messages, max_tokens, temperature,
+                                        enable_thinking=enable_thinking,
+                                        reasoning_effort=reasoning_effort)
             self._json(200, {
                 "id": "cmpl-prose", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
