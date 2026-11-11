@@ -34,24 +34,25 @@ except ImportError:
     VISION_ENABLED = False
 
 LANES = {
-    "dflash2":     ("~/exl3_pipeline/output_exl3/Drafter-DFlash2-EXL3-5.0bpw-h8", 7),
-    "dflash2-bf16":("~/exl3_pipeline/raw_dflash2", 7),
-    "dspine":      ("~/exl3_pipeline/raw_drafter", 15),
-    "dspine-exl3": ("~/exl3_pipeline/output_exl3/Drafter-DSpine-EXL3-5.0bpw-h8", 15),
+    # lane: (drafter dir, window, context pool tokens) — pool sized so weights+pool fit 24G
+    "dspine":       ("~/exl3_pipeline/output_exl3/Drafter-DSpine-EXL3-5.0bpw-h8", 15, 90112),
+    "dspine-bf16":  ("~/exl3_pipeline/raw_drafter", 15, 65536),
+    "dflash2":      ("~/exl3_pipeline/output_exl3/Drafter-DFlash2-EXL3-5.0bpw-h8", 7, 122880),
+    "dflash2-bf16": ("~/exl3_pipeline/raw_dflash2", 7, 98304),
 }
 MODEL_DIR = "~/exl3_pipeline/output_exl3/Model-27B-EXL3-4.0bpw-h8"
 
 
 def build_generator(lane, dynamic, conf):
-    drafter_dir, window = LANES[lane]
+    drafter_dir, window, pool = LANES[lane]
     config = Config.from_directory(os.path.expanduser(MODEL_DIR))
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=122880, max_history=16, max_batch_size=1,
+    cache = Cache(model, max_num_tokens=pool, max_history=16, max_batch_size=1,
                   recurrent_dtype=torch.half)
     draft_config = Config.from_directory(os.path.expanduser(drafter_dir))
     draft_model = Model.from_config(draft_config, component="text")
-    draft_cache = Cache(draft_model, max_num_tokens=122880, max_history=16, max_batch_size=1,
+    draft_cache = Cache(draft_model, max_num_tokens=pool, max_history=16, max_batch_size=1,
                         recurrent_dtype=torch.half)
     draft_model.load(progressbar=False, max_batch_size=1, autosplit_no_forward=True,
                      max_chunk_size=2048)
