@@ -156,7 +156,7 @@ disagree with truncation policy, wasted verify width); hyb16 too wide for prose.
 | Variant | Code t/s | Story t/s |
 |---|---:|---:|
 | dyn c0.35 | 153.6 | — |
-| dyn c0.25 + sparse32k | 147.1 | 61.9 (dyn) |
+| dyn c0.25 + sparse32k | 147.1 | 52.4 (dyn) |
 | dyn c0.35 + sparse32k | 121.6 | — |
 | static15 + hyb8 + sparse32k | — | 62.4 |
 
