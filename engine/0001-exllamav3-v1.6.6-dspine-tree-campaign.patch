@@ -1,0 +1,774 @@
+diff --git a/examples/chat.py b/examples/chat.py
+index 717b18c..b149428 100644
+--- a/examples/chat.py
++++ b/examples/chat.py
+@@ -52,6 +52,8 @@ def main(args):
+     spc = {}
+     if args.think_budget is not None:
+         spc["thinking_budget"] = args.think_budget
++    if args.effort is not None:
++        spc["reasoning_effort"] = args.effort
+     prompt_format.set_special(spc)
+     system_prompt = prompt_format.default_system_prompt(think) if not args.system_prompt else args.system_prompt
+     add_bos = prompt_format.add_bos()
+@@ -658,6 +660,7 @@ if __name__ == "__main__":
+     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
+     parser.add_argument("-no_think", "--no_think", action = "store_true", help = "Suppress think tags (won't necessarily stop reasoning model from reasoning anyway)")
+     parser.add_argument("-think_budget", "--think_budget", type = int, help = "Thinking budget for supported models", default = None)
++    parser.add_argument("-effort", "--effort", type = str, help = "Reasoning effort for supported models (qwen35: xhigh/medium/low)", default = None, choices = ["xhigh", "medium", "low"])
+     parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
+     parser.add_argument("-tps", "--show_tps", action = "store_true", help = "Show tokens/second after every reply")
+     parser.add_argument("-probs", "--probs", type = int, help = "Sample top-K raw probabilities per token, adds overhead", default = 0)
+diff --git a/examples/chat_templates.py b/examples/chat_templates.py
+index 61dd2f1..9c8de1b 100644
+--- a/examples/chat_templates.py
++++ b/examples/chat_templates.py
+@@ -174,6 +174,23 @@ class PromptFormat_qwen35(PromptFormat):
+ 
+     def __init__(self, *args):
+         super().__init__(*args)
++        self.reasoning_instructions = ""
++
++    def set_special(self, spc: dict):
++        # Mirrors the official chat_template.jinja: reasoning_effort in
++        # {xhigh, medium, low}; medium is the unannotated default.
++        effort = spc.get("reasoning_effort", None)
++        if effort == "xhigh":
++            self.reasoning_instructions = ("Reasoning effort is set to xhigh. Please think carefully through the task, "
++                                           "validate key assumptions, consider plausible alternatives, and prioritize "
++                                           "correctness, consistency, and clarity in the final answer.")
++        elif effort == "low":
++            self.reasoning_instructions = ("Reasoning effort is set to low. Keep your thinking brief and focused, "
++                                           "moving directly to the conclusion without unnecessary elaboration.")
++        elif effort is not None and effort != "medium":
++            raise ValueError(f"Unexpected reasoning effort {effort}. Supported: xhigh, medium, low.")
++        else:
++            self.reasoning_instructions = ""
+ 
+     def default_system_prompt(self, think):
+         return (
+@@ -181,6 +198,8 @@ class PromptFormat_qwen35(PromptFormat):
+         )
+ 
+     def format(self, system_prompt, messages, think):
++        if self.reasoning_instructions and think:
++            system_prompt = self.reasoning_instructions + "\n\n" + system_prompt
+         context = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+         for (u, a) in messages:
+             context += f"<|im_start|>user\n{u}<|im_end|>\n"
+diff --git a/exllamav3/architecture/architectures.py b/exllamav3/architecture/architectures.py
+index 25e1470..2ec18da 100644
+--- a/exllamav3/architecture/architectures.py
++++ b/exllamav3/architecture/architectures.py
+@@ -152,5 +152,27 @@ ARCHITECTURES = {
+     ]
+ }
+ 
++class _DspineAwareConfig:
++    """Config dispatcher for the DFlashDraftModel architecture string: DSpine checkpoints
++    (dflash_config.selected_prefix_code_bridge) load as DSpineConfig/DSpineModel, every
++    other DFlash checkpoint keeps the stock DFlashConfig/DFlashModel path."""
++
++    arch_string = "DFlashDraftModel"
++
++    def __new__(cls, directory, **kwargs):
++        import json as _json
++        import os as _os
++        with open(_os.path.join(directory, "config.json"), encoding = "utf-8") as f:
++            d = _json.load(f)
++        if (d.get("dflash_config") or {}).get("selected_prefix_code_bridge"):
++            from .dspine import DSpineConfig
++            return DSpineConfig(directory, **kwargs)
++        from .dflash import DFlashConfig
++        return DFlashConfig(directory, **kwargs)
++
++
++ARCHITECTURES["DFlashDraftModel"]["config_class"] = _DspineAwareConfig
++
++
+ def get_architectures():
+     return ARCHITECTURES
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 9d11f6f..9304b82 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -2,6 +2,10 @@ from __future__ import annotations
+ import logging
+ import torch
+ import os
++
++# Tree-port research capture: per-round (draft chain, target argmax window, drafter lattice)
++TREE_CAPTURE: list = []
++
+ from ..model.model import Model
+ from ..cache.cache import Cache
+ from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
+@@ -799,6 +803,13 @@ class Generator:
+         if self.sparse_head is not None and draft_window > 0:
+             self._sparse_flag = self.sparse_head.round_flag()
+             round_start = time.perf_counter()
++        # Round anatomy timer (research): per-phase wall time, env DSPINE_ROUND_TIMER=1
++        _rt = getattr(self, "_rt_on", None)
++        if _rt is None:
++            _rt = self._rt_on = bool(os.environ.get("DSPINE_ROUND_TIMER"))
++            self._rt_draft, self._rt_gen = [], []
++        _rt_t0 = time.perf_counter() if _rt else None
++        draft_tokens = None
+         if self.draft_model and draft_window > 0:
+             if self.dflash_draft:
+                 draft_tokens = self.iterate_draftmodel_dflash_gen(results, draft_window)
+@@ -806,14 +817,11 @@ class Generator:
+                 draft_tokens = self.iterate_draftmodel_mtp_gen(results, draft_window)
+             else:
+                 draft_tokens = self.iterate_draftmodel_gen(results, draft_window)
+-
+-        # Generation with n-gram draft
+         elif self.ngram_match_min:
+             draft_tokens = self.iterate_ngram_gen(results)
+-
+-        # Regular generation
+         else:
+             draft_tokens = None
++        if _rt: self._rt_draft.append(time.perf_counter() - _rt_t0)
+ 
+         # Long suffix-match draft over the regular one, when a job is repeating its context
+         if self.hybrid_draft_tokens:
+@@ -821,7 +829,11 @@ class Generator:
+                 draft_tokens, self.row_limited(self.hybrid_draft_tokens)
+             )
+ 
++        if _rt:
++            _rt_t1 = time.perf_counter()
+         self.iterate_gen(results, draft_tokens)
++        if _rt:
++            self._rt_gen.append(time.perf_counter() - _rt_t1)
+         if round_start is not None and draft_tokens is not None:
+             # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
+             drafted = draft_tokens.shape[-1]
+@@ -1775,6 +1787,17 @@ class Generator:
+             params = params,
+         )
+ 
++        # Tree-port research hook (DSPINE_TREE_CAPTURE): stash the target's greedy argmax
++        # over the whole verify window plus the drafted chain, for offline tree replay.
++        import os as _os
++        if draft_tokens is not None and _os.environ.get("DSPINE_TREE_CAPTURE"):
++            _lat = getattr(self.draft_model, "_lattice_out", None) if self.draft_model else None
++            TREE_CAPTURE.append({
++                "draft": draft_tokens.detach().cpu().clone(),
++                "target_argmax": batch_logits[:, :, :].argmax(dim = -1).detach().cpu().clone(),
++                "lattice": _lat,
++            })
++
+         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
+         # references to recurrent state objects past this iteration.
+         p_export_states = params.get("export_states")
+@@ -2188,6 +2211,9 @@ class Generator:
+ 
+ 
+     def reap_failed_job(self, job, error, results: list):
++        import traceback as _tb
++        print("[JOB ERROR TRACEBACK]", flush = True)
++        _tb.print_exception(type(error), error, error.__traceback__)
+         """
+         Contain a per-job failure so the generator stays usable for other jobs: release the
+         failed job's pages and recurrent state, drop it from the active set, and append an
+diff --git a/exllamav3/modules/attention_fn/bighead_scalar.py b/exllamav3/modules/attention_fn/bighead_scalar.py
+index 8673516..39e92e7 100644
+--- a/exllamav3/modules/attention_fn/bighead_scalar.py
++++ b/exllamav3/modules/attention_fn/bighead_scalar.py
+@@ -5,6 +5,7 @@ from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
+ KV_CHUNK_SIZE = 128
+ 
+ def fn_bighead_scalar_attn(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         args.is_swa() or
+diff --git a/exllamav3/modules/attention_fn/common.py b/exllamav3/modules/attention_fn/common.py
+index 058bb5c..88d8b0e 100644
+--- a/exllamav3/modules/attention_fn/common.py
++++ b/exllamav3/modules/attention_fn/common.py
+@@ -31,6 +31,8 @@ class AttnArgs(NamedTuple):
+     sink_key0: bool = False         # sinks bias each segment's first key instead of adding a logit (MiMo-ViT)
+     staging_pages: int | None = None    # pages the quantized-cache prefill staging scratch is sized to
+                                         # (a per-layer constant: the pool, or QSA's bounded window)
++    tree_mask: torch.Tensor | None = None   # [q_len, kv_append_len] int8 ancestor mask: tree verify.
++                                        # Window keys gate on this instead of causality; history stays visible.
+ 
+     def sanity_check(self):
+         # Cache must be paged
+diff --git a/exllamav3/modules/attention_fn/dispatch.py b/exllamav3/modules/attention_fn/dispatch.py
+index 1e5f2ac..3b5fc47 100644
+--- a/exllamav3/modules/attention_fn/dispatch.py
++++ b/exllamav3/modules/attention_fn/dispatch.py
+@@ -100,6 +100,7 @@ def attn_dispatch(
+     dispatch_cache: dict | None = None,
+     max_kv_len: int | None = None,
+     staging_pages: int | None = None,
++    tree_mask: torch.Tensor | None = None,
+ ):
+     """
+     Select and run the first compatible attention implementation for the supplied tensors.
+@@ -158,6 +159,7 @@ def attn_dispatch(
+         window_right = window_right,
+         sink_key0 = sink_key0,
+         staging_pages = staging_pages,
++        tree_mask = tree_mask,
+     )
+     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
+     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
+diff --git a/exllamav3/modules/attention_fn/torch.py b/exllamav3/modules/attention_fn/torch.py
+index 6413608..88fd1e5 100644
+--- a/exllamav3/modules/attention_fn/torch.py
++++ b/exllamav3/modules/attention_fn/torch.py
+@@ -26,6 +26,7 @@ def _warn_sdpa_fallback():
+ 
+ 
+ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.has_kv_cache() or
+         args.is_swa() or
+@@ -50,6 +51,7 @@ def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
+ 
+ 
+ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     # Turing takes this path for every prefill chunk (see attn_dispatch), not only for head_dim >= 512
+     turing_prefill = args.q_len > 8 and sdpa_prefill(args.q.device)
+     if (
+diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
+index 2370bfc..c72df69 100644
+--- a/exllamav3/modules/attention_fn/triton_paged.py
++++ b/exllamav3/modules/attention_fn/triton_paged.py
+@@ -126,6 +126,7 @@ def _paged_attn_splitdv_kernel(
+     cache_seqlens,
+     out,
+     sinks,
++    tree_mask,
+     q_len,               # runtime: only used in masks and address math
+     kv_append_len,       # runtime
+     n_q_heads: tl.constexpr,
+@@ -141,6 +142,7 @@ def _paged_attn_splitdv_kernel(
+     HAS_WINDOW_RIGHT: tl.constexpr,
+     SOFTCAP: tl.constexpr,
+     HAS_SINKS: tl.constexpr,
++    HAS_TREE_MASK: tl.constexpr,   # tree verify: ancestor mask over the appended window
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_DV: tl.constexpr,
+@@ -187,7 +189,16 @@ def _paged_attn_splitdv_kernel(
+             scores = (2.0 / (1.0 + tl.exp(-2.0 * scores_scaled)) - 1.0) * SOFTCAP
+ 
+         valid = (offs_m[:, None] < q_len) & (offs_n[None, :] < total_k_len)
+-        if CAUSAL:
++        if HAS_TREE_MASK:
++            # Tree verify: window keys (the appended tree rows) are gated by the [W, W]
++            # ancestor mask instead of causality; history keys stay fully visible.
++            win0 = total_k_len - kv_append_len
++            in_win = offs_n[None, :] >= win0
++            kv_row = offs_n[None, :] - win0
++            tm_ptrs = tree_mask + offs_m[:, None] * kv_append_len + kv_row
++            tm = tl.load(tm_ptrs, mask=in_win & (offs_m[:, None] < q_len) & (kv_row < kv_append_len), other=0)
++            valid = valid & tl.where(in_win, tm != 0, True)
++        elif CAUSAL:
+             valid = valid & (offs_n[None, :] <= q_abs[:, None])
+         if HAS_WINDOW_LEFT:
+             valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
+@@ -407,6 +418,7 @@ def paged_attn_triton(
+     block_dv: int | None = None,
+     num_warps: int = 8,
+     num_stages: int = 3,
++    tree_mask: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Paged KV-cache attention with GQA and optional in-place cache append.
+ 
+@@ -481,6 +493,17 @@ def paged_attn_triton(
+         block_dv = head_dim
+     num_pages_per_seq = block_table.shape[1]
+ 
++    if tree_mask is not None:
++        assert tree_mask.dtype == torch.int8 and tree_mask.is_cuda
++        assert tree_mask.shape == (q_len, kv_append_len), \
++            f"tree_mask must be [q_len, kv_append_len] = [{q_len}, {kv_append_len}]"
++        assert k is not None and kv_append_len > 0
++        tm = tree_mask.contiguous()
++        has_tree_mask = True
++    else:
++        tm = sinks if sinks is not None else q  # dummy pointer, never dereferenced
++        has_tree_mask = False
++
+     with torch.cuda.device(q.device):
+         if k is not None and kv_append_len:
+             _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+@@ -496,6 +519,7 @@ def paged_attn_triton(
+             cache_seqlens,
+             out,
+             sinks,
++            tm,
+             q_len,
+             kv_append_len,
+             n_q_heads,
+@@ -511,6 +535,7 @@ def paged_attn_triton(
+             window_right >= 0,
+             float(softcap or 0.0),
+             has_sinks,
++            has_tree_mask,
+             block_m,
+             block_n,
+             block_dv,
+@@ -682,10 +707,12 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
+         window_size=args.get_window_size(),
+         softcap=args.softcap,
+         sinks=args.sinks,
++        tree_mask=args.tree_mask,
+     )
+ 
+ 
+ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         not args.has_kv_cache() or
+@@ -1335,6 +1362,7 @@ def paged_attn_triton_decode(
+ 
+ 
+ def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         not args.has_kv_cache() or
+@@ -2245,6 +2273,7 @@ def paged_attn_triton_prefill(
+ 
+ 
+ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     """Non-cached attention through the prefill kernel's direct-kv source (NEW_KV=2)."""
+     if (
+         args.is_varlen() or
+@@ -2271,6 +2300,7 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
+ 
+ 
+ def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         not args.has_kv_cache() or
+@@ -2516,6 +2546,7 @@ def varlen_attn_triton(
+ 
+ 
+ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         not args.is_varlen() or
+         args.bsz > 1 or
+@@ -2542,6 +2573,7 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
+ 
+ 
+ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.q_cache is None or
+         args.q_len > 16 or
+@@ -2570,6 +2602,7 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
+ 
+ 
+ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.q_cache is None or
+         (args.q_len <= 16 and not args.non_causal_spans) or
+diff --git a/exllamav3/modules/attention_fn/xformers.py b/exllamav3/modules/attention_fn/xformers.py
+index 0f13e6d..81bf371 100644
+--- a/exllamav3/modules/attention_fn/xformers.py
++++ b/exllamav3/modules/attention_fn/xformers.py
+@@ -49,6 +49,7 @@ def _stable_xformers_gqa_via_4d(q5, k5, v5, attn_bias = None, scale = None):
+ 
+ 
+ def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         args.has_kv_cache() or
+@@ -86,6 +87,7 @@ def fn_xformers_cutlass_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
+ 
+ 
+ def fn_xformers_cutlass_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
++    if args.tree_mask is not None: return None
+     if (
+         args.is_varlen() or
+         not args.has_kv_cache() or
+diff --git a/exllamav3/modules/attn.py b/exllamav3/modules/attn.py
+index c69c67a..ffc0339 100644
+--- a/exllamav3/modules/attn.py
++++ b/exllamav3/modules/attn.py
+@@ -1133,7 +1133,8 @@ class Attention(Module):
+         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
+         if (
+             _bc_attn_enable and non_causal_spans is None and
+-            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
++            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
++            params.get("tree_mask") is None
+         ):
+             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
+                                   host_seqlens = qsa_seqlens_cpu)
+@@ -1211,6 +1212,7 @@ class Attention(Module):
+                 dispatch_cache = self.dispatch_cache,
+                 max_kv_len = max_kv_len,
+                 staging_pages = staging_pages,
++                tree_mask = params.get("tree_mask"),
+             )
+ 
+         if self.headwise_gate:
+diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
+index 1c37241..8f702b8 100644
+--- a/exllamav3/modules/gated_delta_net.py
++++ b/exllamav3/modules/gated_delta_net.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ from typing_extensions import override
++import os
+ import torch
+ import torch.nn.functional as F
+ from ..model.config import Config
+@@ -1305,7 +1306,8 @@ class GatedDeltaNet(Module):
+             self.bc_split and save_state and
+             recurrent_slots is not None and
+             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
+-            not spec_step
++            not spec_step and
++            params.get("tree_parents") is None
+         ):
+             stage_key = id(rsl) if save_history else 0
+             if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
+@@ -1428,39 +1430,130 @@ class GatedDeltaNet(Module):
+             )
+ 
+         # Convolution
+-        mixed_qkv = causal_conv1d_update(
+-            mixed_qkv = mixed_qkv,
+-            conv_state = conv_state,
+-            recurrent_slots = recurrent_slots,
+-            conv1d_weight = self.conv1d_weight_flat,
+-            conv1d_bias = self.conv1d_bias,
+-            history = save_history,
+-            params = params,
+-            token_major = conv_token_major,
+-            incremental = bool(spec_step),
+-        )
+-        if save_history:
+-            mixed_qkv = staged_conv.copy_(mixed_qkv)
+-
+-        # Delta rule
+-        core_attn_out = gated_delta_rule_fn(
+-            mixed_qkv = mixed_qkv,
+-            beta = beta,
+-            g = g,
+-            recurrent_state = recurrent_state,
+-            recurrent_slots = slots_scan,
+-            slots_in = slots_scan_in,
+-            history = scan_history,
+-            save_state = save_state,
+-            num_k_heads = self.num_k_heads,
+-            num_v_heads = self.num_v_heads,
+-            k_dim = self.k_dim,
+-            v_dim = self.v_dim,
+-            k_head_dim = self.k_head_dim,
+-            v_head_dim = self.v_head_dim,
+-            params = params,
+-            channelwise_g = self.kda,
+-        )
++        tree_parents = params.get("tree_parents")
++        if os.environ.get("DSPINE_TREE_NOGDN"):
++            tree_parents = None    # probe: linear trees can run the normal sequential GDN path
++        if tree_parents is not None:
++            # TREE VERIFY pass: rows are tree nodes in topological order (row 0 = anchor,
++            # parent -1). Stored states are read-only; per-node conv tails + scan inputs
++            # are retained for the commit-time state recompute.
++            from .gated_delta_net_fn.conv1d import causal_conv1d_update_tree
++            from .gated_delta_net_fn.gated_delta_rule import gated_delta_rule_tree
++            slot = int(recurrent_slots[0].item()) if recurrent_slots is not None else 0
++            if conv_state is None:
++                ring = torch.zeros((1, self.conv1d_weight_flat.shape[0], self.conv1d_weight_flat.shape[-1]),
++                                   dtype = torch.bfloat16, device = self.device)
++            else:
++                ring = conv_state if conv_state.dim() == 2 else conv_state[slot]
++                if ring.dim() == 2: ring = ring.unsqueeze(0)
++            qkv_tok = mixed_qkv if conv_token_major else mixed_qkv.transpose(1, 2)
++            qkv_tok = qkv_tok.to(torch.bfloat16).contiguous()
++            # Re-base the conv ring via the CHAIN's own 1-token update on the anchor row:
++            # normalizes the live K-window to cols 0..K-1 regardless of what the previous
++            # pass (prefill/history vs verify) left in the K+history-wide ring. The kernel
++            # indexes the FULL pool by slot internally.
++            K_w = self.conv1d_weight_flat.shape[-1]
++            if conv_state is not None:
++                y0 = causal_conv1d_update(
++                    mixed_qkv = qkv_tok[:, 0:1],
++                    conv_state = conv_state,
++                    recurrent_slots = recurrent_slots,
++                    conv1d_weight = self.conv1d_weight_flat,
++                    conv1d_bias = self.conv1d_bias,
++                    history = False,
++                    params = params,
++                    token_major = True,
++                    incremental = bool(spec_step),
++                )
++                ring = (conv_state if conv_state.dim() == 2 else conv_state[slot])[:, :K_w].unsqueeze(0).contiguous()
++            else:
++                y0 = None
++                ring = torch.zeros((1, self.conv1d_weight_flat.shape[0], K_w),
++                                   dtype = torch.bfloat16, device = self.device)
++            _tt = __import__("time").perf_counter() if __import__("os").environ.get("DSPINE_TREE_DEBUG") else None
++            mixed_qkv, tails = causal_conv1d_update_tree(
++                qkv_tok, ring, tree_parents, params["tree_depths"],
++                self.conv1d_weight_flat, self.conv1d_bias,
++                conv_index = params.get("tree_conv_index"),
++            )
++            if _tt is not None:
++                __import__("torch").cuda.synchronize(self.device)
++                print(f"[tree-timing] conv {__import__('time').perf_counter()-_tt:.3f}", flush = True)
++                _tt = __import__("time").perf_counter()
++            if y0 is not None:
++                mixed_qkv = mixed_qkv.clone()
++                mixed_qkv[:, 0:1] = y0        # anchor row: exactly the chain's value
++            del qkv_tok
++            # Base state row: a speculative pass reads from slots_scan_in (the scan's input
++            # row); non-spec falls back to the scan write row
++            if slots_scan_in is not None:
++                base_row = int(slots_scan_in[0].item())
++            elif slots_scan is not None:
++                base_row = int(slots_scan[0].item())
++            else:
++                base_row = 0
++            state_rows = sorted({base_row, int(slots_scan[0].item()) if slots_scan is not None else base_row})
++            base_state = recurrent_state[base_row, 0:1] if recurrent_state is not None else torch.zeros(
++                (1, self.num_v_heads, self.k_head_dim, self.v_head_dim),
++                dtype = torch.float, device = self.device)
++            core_attn_out, node_states = gated_delta_rule_tree(
++                mixed_qkv.contiguous(), beta.contiguous(), g.contiguous(), base_state,
++                tree_parents, self.num_k_heads, self.num_v_heads,
++                self.k_dim, self.v_dim, self.k_head_dim, self.v_head_dim,
++                levels = params.get("tree_levels"),
++            )
++            if _tt is not None:
++                __import__("torch").cuda.synchronize(self.device)
++                print(f"[tree-timing] delta {__import__('time').perf_counter()-_tt:.3f}", flush = True)
++            tree_out = params.setdefault("tree_out", {})
++            tree_out.setdefault("tails", {})[self.layer_idx] = tails
++            tree_out.setdefault("state_rows", {})[self.layer_idx] = state_rows
++            # Retain per-node recurrent states in the pool's dtype (recurrent_dtype, half here)
++            # so the committed row's rounding matches the chain engine exactly; ~34MB/layer @ cap 32
++            _ns_dtype = recurrent_state.dtype if recurrent_state is not None else torch.bfloat16
++            tree_out.setdefault("node_states", {})[self.layer_idx] = node_states.to(_ns_dtype)
++            tree_out.setdefault("conv_y", {})[self.layer_idx] = mixed_qkv
++            tree_out.setdefault("beta", {})[self.layer_idx] = beta
++            tree_out.setdefault("g", {})[self.layer_idx] = g
++            tree_out.setdefault("slots", {})[self.layer_idx] = slot
++            tree_out.setdefault("dims", {})[self.layer_idx] = (
++                self.num_k_heads, self.num_v_heads, self.k_dim, self.v_dim,
++                self.k_head_dim, self.v_head_dim,
++            )
++        else:
++            mixed_qkv = causal_conv1d_update(
++                mixed_qkv = mixed_qkv,
++                conv_state = conv_state,
++                recurrent_slots = recurrent_slots,
++                conv1d_weight = self.conv1d_weight_flat,
++                conv1d_bias = self.conv1d_bias,
++                history = save_history,
++                params = params,
++                token_major = conv_token_major,
++                incremental = bool(spec_step),
++            )
++            if save_history:
++                mixed_qkv = staged_conv.copy_(mixed_qkv)
++
++            # Delta rule
++            core_attn_out = gated_delta_rule_fn(
++                mixed_qkv = mixed_qkv,
++                beta = beta,
++                g = g,
++                recurrent_state = recurrent_state,
++                recurrent_slots = slots_scan,
++                slots_in = slots_scan_in,
++                history = scan_history,
++                save_state = save_state,
++                num_k_heads = self.num_k_heads,
++                num_v_heads = self.num_v_heads,
++                k_dim = self.k_dim,
++                v_dim = self.v_dim,
++                k_head_dim = self.k_head_dim,
++                v_head_dim = self.v_head_dim,
++                params = params,
++                channelwise_g = self.kda,
++            )
+         del mixed_qkv, beta, g
+ 
+         # Norm
+diff --git a/exllamav3/modules/gated_delta_net_fn/conv1d.py b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+index 6ed4a11..24cc185 100644
+--- a/exllamav3/modules/gated_delta_net_fn/conv1d.py
++++ b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+@@ -465,3 +465,67 @@ def causal_conv1d_update(
+     )
+ 
+     return mixed_qkv
++
++
++def causal_conv1d_update_tree(
++    qkv_token: torch.Tensor,          # [bsz, W, dim] token-major bf16 (row 0 = anchor)
++    conv_state: torch.Tensor,         # [bsz, dim, K] bf16 ring (pre-anchor)
++    parents: torch.Tensor,            # [W] long
++    depths: torch.Tensor,             # [W] long; anchor row 0 depth 0
++    conv1d_weight: torch.Tensor,      # [dim, 1, K]
++    conv1d_bias: torch.Tensor | None,
++    conv_index: torch.Tensor | None = None,   # precomputed [W, K] long: row idx, or -1-ringcol
++):
++    """
++    Tree conv: each row's receptive field is its PATH's previous K-1 qkv columns (ancestors),
++    falling back to the ring's tail near the root. Returns (y [bsz, W, dim] bf16,
++    tails [W, bsz, dim, K] bf16: each row's post-commit ring content).
++    Vectorized assembly: conv_index precomputed once per round (all layers share topology).
++    """
++    import torch.nn.functional as F
++    bsz, W, dim = qkv_token.shape
++    K = conv1d_weight.shape[-1]
++    dev = qkv_token.device
++
++    if conv_index is None:
++        # ancestor_at[row, j] = row index of ancestor at depth (depth(row) - (K - j)), or -1 for ring
++        conv_index = torch.full((W, K), -1, dtype = torch.long, device = dev)
++        par = parents.tolist()
++        dep = depths.tolist()
++        for r in range(W):
++            d = dep[r]
++            chain = []
++            p = par[r]
++            while p >= 0:
++                chain.append(p)
++                p = par[p]
++            for j in range(K):
++                eff = d - (K - 1 - j)
++                if eff == d:
++                    conv_index[r, j] = r
++                elif eff >= 0:
++                    conv_index[r, j] = chain[d - 1 - eff]
++                else:
++                    conv_index[r, j] = -1 - (K + eff)
++    assert conv_index is not None
++
++    # Gather path columns from this round's qkv and ring in three fused ops
++    ring = conv_state.permute(2, 0, 1)                    # [K, bsz, dim]
++    A = conv_index                                         # [W, K]
++    from_qkv = qkv_token[:, A.clamp(min = 0)]             # [bsz, W, K, dim] gather (rows)
++    ring_cols = (-1 - A).clamp(min = 0)                   # [W, K] ring col per slot
++    from_ring = ring[ring_cols]                           # [W, K, bsz, dim]
++    inputs = torch.where(A.view(W, K, 1, 1) >= 0,
++                         from_qkv.permute(1, 2, 0, 3),
++                         from_ring.permute(0, 1, 2, 3).to(from_qkv.dtype))  # [W, K, bsz, dim]
++
++    # conv: out[r] = silu(sum_j w[:, 0, j] . inputs[r, j] + bias)
++    w = conv1d_weight.float()                             # [dim, K] or [dim, 1, K]
++    if w.dim() == 3: w = w[:, 0, :]
++    y = torch.einsum("d k , r k b d -> r b d", w, inputs.float()).permute(1, 0, 2)
++    if conv1d_bias is not None:
++        y = y + conv1d_bias.float().view(1, 1, -1)
++    y = F.silu(y).to(torch.bfloat16)
++    # per-row ring tails: the row's own input columns (its path stream's last K columns)
++    tails = inputs.permute(0, 2, 3, 1).contiguous()       # [W, bsz, dim, K]
++    return y, tails
+diff --git a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+index cc97343..90ebb3d 100644
+--- a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
++++ b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+@@ -261,3 +261,89 @@ def gated_delta_rule_fn(
+         )
+ 
+     return core_attn_out
++
++
++def gated_delta_rule_tree(
++    mixed_qkv: torch.Tensor,          # [bsz, W, k_dim + k_dim + v_dim] token-major (row 0 = anchor)
++    beta: torch.Tensor,               # [bsz, W, num_v_heads]
++    g: torch.Tensor,                  # [bsz, W, num_v_heads] (log decay)
++    base_state: torch.Tensor,         # [1, num_v_heads, k_head_dim, v_head_dim] fp32 (pre-anchor)
++    parents: torch.Tensor,            # [W] long; parents[0] = -1 (anchor: from base_state)
++    num_k_heads: int,
++    num_v_heads: int,
++    k_dim: int,
++    v_dim: int,
++    k_head_dim: int,
++    v_head_dim: int,
++    levels: list | None = None,       # precomputed [(idx_t, par_t), ...] per depth level
++):
++    """Tree-state delta rule: walk rows in topological order, each node starting from its
++    parent's state (base for the anchor row). Mirrors torch_recurrent_gated_delta_rule with
++    in-kernel q/k l2norm semantics. Returns (out [bsz, W, Hv, Dv] bf16, node_states
++    [W, 1, Hv, Dk, Dv] fp32 aligned with recurrent_state rows for direct commit)."""
++    import torch.nn.functional as F
++    bsz, W, _ = mixed_qkv.shape
++    dev = mixed_qkv.device
++    q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
++    q = q.view(bsz, W, num_k_heads, k_head_dim).float()
++    k = k.view(bsz, W, num_k_heads, k_head_dim).float()
++    v = v.view(bsz, W, num_v_heads, v_head_dim).float()
++
++    def l2norm(x):
++        return x * torch.rsqrt((x * x).sum(dim = -1, keepdim = True) + 1e-6)
++
++    q = l2norm(q)
++    k = l2norm(k)
++    scale = k_head_dim ** -0.5
++
++    # group mapping: v head j uses k head j // (Hv // Hk)
++    group = num_v_heads // num_k_heads
++    k_vh = k.repeat_interleave(group, dim = 2)            # [bsz, W, Hv, Dk]
++
++    beta_f = beta.float()
++    g_f = g.float()
++
++    node_states = torch.empty((W, bsz, 1, num_v_heads, k_head_dim, v_head_dim),
++                              dtype = torch.float, device = dev)
++    out = torch.empty((bsz, W, num_v_heads, v_head_dim), dtype = torch.bfloat16, device = dev)
++
++    # Depth-level batched walk: all nodes at the same depth update from their parent states
++    # in one batched op (5 levels for cap 16 instead of 16 per-node iterations). Numerics
++    # identical to the per-node loop: same order of ops per node, gathered by parent row.
++    q_vh = q.repeat_interleave(group, dim = 2)          # [bsz, W, Hv, Dk]
++    node_states = node_states.view(W, bsz, num_v_heads, k_head_dim, v_head_dim)
++    if levels is None:
++        # level buckets from parents (anchor first)
++        par_l = parents.tolist() if torch.is_tensor(parents) else list(parents)
++        levels_l: list[list[int]] = [[] for _ in range(W + 1)]
++        depth_of = [0] * W
++        for r in range(W):
++            p = par_l[r]
++            depth_of[r] = 0 if p < 0 else depth_of[p] + 1
++        for r in range(W):
++            levels_l[depth_of[r]].append(r)
++        levels = [
++            (torch.tensor(ix, dtype = torch.long, device = dev),
++             torch.tensor([par_l[r] for r in ix], dtype = torch.long, device = dev))
++            for ix in levels_l if ix
++        ]
++    base32 = base_state.to(torch.float).view(1, num_v_heads, k_head_dim, v_head_dim)
++    for li, (idx_t, par_t) in enumerate(levels):
++        n = idx_t.shape[0]
++        if li == 0:                                   # depth-0 level = anchor rows (parent -1)
++            S_p = base32.expand(n, bsz, num_v_heads, k_head_dim, v_head_dim)
++        else:
++            S_p = node_states[par_t]                  # [n, bsz, Hv, Dk, Dv]
++        k_d = k_vh[:, idx_t].permute(1, 0, 2, 3)        # [n, bsz, Hv, Dk]
++        q_d = q_vh[:, idx_t].permute(1, 0, 2, 3)
++        v_d = v[:, idx_t].permute(1, 0, 2, 3)           # [n, bsz, Hv, Dv]
++        g_d = g_f[:, idx_t].exp().permute(1, 0, 2).unsqueeze(-1)     # [n, bsz, Hv, 1]
++        beta_d = beta_f[:, idx_t].permute(1, 0, 2).unsqueeze(-1)
++        kv_mem = (S_p * k_d.unsqueeze(-1)).sum(dim = -2)            # [n, bsz, Hv, Dv]
++        v_t = v_d - kv_mem * g_d
++        upd = k_d.unsqueeze(-1) * (v_t * beta_d).unsqueeze(-2)
++        S = S_p * g_d.unsqueeze(-1) + upd
++        node_states[idx_t] = S
++        o = (S * q_d.unsqueeze(-1)).sum(dim = -2).mul(scale)        # [n, bsz, Hv, Dv]
++        out[:, idx_t] = o.permute(1, 0, 2, 3).to(torch.bfloat16)
++    return out, node_states
