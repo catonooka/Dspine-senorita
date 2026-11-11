@@ -188,3 +188,30 @@ design was sound). Capture dies with torch AcceleratorError inside the target fo
 The apparent +10% in early A/Bs was acceptance-trajectory noise (graphs=0 at exit;
 round_ms identical 45.5 vs 45.7). LAW: verify pass not graphable without moving cache
 growth out of the captured region — days of surgery for ~10ms/round.
+
+## Camp 5 — 6bpw drafter body (Drafter-DSpine-EXL3-6.0bpw-h8, spinecamp5.json)
+
+code static15 142.2/134.3 (mean 138.3 vs 5bpw 134.0), code dyn 131.6 (wash), story 54.7
+(wash). +0-3% at best, inside the noise band. VERDICT: keep Drafter-DSpine-EXL3-5.0bpw-h8
+(smaller, equal); 6bpw retained as comparison artifact.
+
+# Campaign close-out vs targets (single 3090, DSpine only, vision+thinking on)
+
+| Lane | Target | Measured (mean, 400 tok ×3) | Best single | Status |
+|---|---:|---:|---:|---|
+| Code | 200 | 131-138 | 143.4 (187.4 lucky trajectory, 200-tok) | MISSED −30% |
+| Prose story | 120 | 55-57 | 64.7 | MISSED −55% |
+
+Physics: committed/round = 6.2 code / 2.7 story at 42-46 ms rounds. 200 t/s code needs
+8.5 committed (drafter acceptance ceiling) or <30 ms rounds (verify graph dead — see
+camp 4 law; only path = Triton tree-delta kernel, est days). 120 t/s prose needs 5+
+committed — DSpine's high-entropy creative-text weakness (paper's own gains shrink there;
+DFlash2 does 2.5/round on this bench — no drafter in reach of 5).
+
+Levers tried and closed: dynamic verify (✓ code, wash on reps), n-gram hybrid (✓ prose
++5-8%, static+hyb8), sparse head (✗), h16 head (✗), 6bpw body (flat), verify CUDA
+graph (✗ AcceleratorError), window sweeps, EXL3 drafter quant (✓ 5bpw-h8, serving).
+
+Still open if we ever reopen: Triton tree-delta kernel (launch-bound 240ms tree rounds
+→ 60-80ms), cache-growth-outside-capture to resurrect verify graph, recurrent
+max_history>16 to unlock TREE_CAP>15.

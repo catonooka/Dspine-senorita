@@ -1,0 +1,35 @@
+{
+  "code_static15": {
+    "tps": [
+      142.2,
+      134.3
+    ],
+    "committed": [
+      6.56,
+      6.25
+    ],
+    "mean_tps": 92.2
+  },
+  "code_dyn_c025": {
+    "tps": [
+      136.9,
+      126.3
+    ],
+    "committed": [
+      6.35,
+      5.88
+    ],
+    "mean_tps": 87.7
+  },
+  "story_stat_hyb8": {
+    "tps": [
+      59.4,
+      49.9
+    ],
+    "committed": [
+      2.72,
+      2.29
+    ],
+    "mean_tps": 36.4
+  }
+}
