@@ -1,0 +1,44 @@
+{
+  "ndt4": {
+    "tokens": 400,
+    "rounds": 173,
+    "committed": 2.31,
+    "tps": 48.9
+  },
+  "ndt6": {
+    "tokens": 400,
+    "rounds": 151,
+    "committed": 2.65,
+    "tps": 54.7
+  },
+  "ndt8": {
+    "tokens": 400,
+    "rounds": 164,
+    "committed": 2.44,
+    "tps": 49.0
+  },
+  "ndt10": {
+    "tokens": 400,
+    "rounds": 144,
+    "committed": 2.78,
+    "tps": 54.7
+  },
+  "ndt12": {
+    "tokens": 400,
+    "rounds": 179,
+    "committed": 2.23,
+    "tps": 43.1
+  },
+  "ndt15": {
+    "tokens": 400,
+    "rounds": 169,
+    "committed": 2.37,
+    "tps": 44.4
+  },
+  "dynamic15": {
+    "tokens": 400,
+    "rounds": 135,
+    "committed": 2.96,
+    "tps": 55.5
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "think_dyn7_c0.25": {
+    "tokens": 400,
+    "rounds": 132,
+    "committed": 2.67,
+    "tps": 64.7
+  },
+  "think_dyn7_c0.65": {
+    "tokens": 400,
+    "rounds": 80,
+    "committed": 2.71,
+    "tps": 49.2
+  },
+  "nothink_dyn7_c0.25": {
+    "tokens": 400,
+    "rounds": 154,
+    "committed": 2.55,
+    "tps": 67.0
+  },
+  "nothink_dyn7_c0.65": {
+    "tokens": 400,
+    "rounds": 96,
+    "committed": 2.56,
+    "tps": 50.5
+  }
+}

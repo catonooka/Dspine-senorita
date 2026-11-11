@@ -1,0 +1,20 @@
+{
+  "code_think": {
+    "rounds": 34,
+    "committed_per_round": 6.67,
+    "round_ms": 69.2,
+    "draft_ms": 30.1,
+    "gen_ms": 35.0,
+    "gap_ms": 4.1,
+    "tps": 96.3
+  },
+  "prose_think": {
+    "rounds": 79,
+    "committed_per_round": 2.78,
+    "round_ms": 44.6,
+    "draft_ms": 10.7,
+    "gen_ms": 34.6,
+    "gap_ms": -0.7,
+    "tps": 62.5
+  }
+}

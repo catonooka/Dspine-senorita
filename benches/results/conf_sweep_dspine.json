@@ -1,0 +1,50 @@
+{
+  "think_dyn15_c0.25": {
+    "tokens": 400,
+    "rounds": 144,
+    "committed": 2.78,
+    "tps": 60.0
+  },
+  "think_dyn15_c0.4": {
+    "tokens": 400,
+    "rounds": 172,
+    "committed": 2.33,
+    "tps": 49.0
+  },
+  "think_dyn15_c0.5": {
+    "tokens": 400,
+    "rounds": 161,
+    "committed": 2.48,
+    "tps": 51.7
+  },
+  "think_dyn15_c0.65": {
+    "tokens": 400,
+    "rounds": 143,
+    "committed": 2.8,
+    "tps": 58.0
+  },
+  "nothink_dyn15_c0.25": {
+    "tokens": 400,
+    "rounds": 192,
+    "committed": 2.08,
+    "tps": 43.2
+  },
+  "nothink_dyn15_c0.4": {
+    "tokens": 400,
+    "rounds": 205,
+    "committed": 1.95,
+    "tps": 40.4
+  },
+  "nothink_dyn15_c0.5": {
+    "tokens": 400,
+    "rounds": 193,
+    "committed": 2.07,
+    "tps": 42.9
+  },
+  "nothink_dyn15_c0.65": {
+    "tokens": 400,
+    "rounds": 201,
+    "committed": 1.99,
+    "tps": 41.0
+  }
+}

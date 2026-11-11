@@ -1,0 +1,50 @@
+{
+  "think_dyn7_c0.25": {
+    "tokens": 400,
+    "rounds": 113,
+    "committed": 3.07,
+    "tps": 58.0
+  },
+  "think_dyn7_c0.4": {
+    "tokens": 400,
+    "rounds": 95,
+    "committed": 2.96,
+    "tps": 54.4
+  },
+  "think_dyn7_c0.5": {
+    "tokens": 400,
+    "rounds": 91,
+    "committed": 3.04,
+    "tps": 55.0
+  },
+  "think_dyn7_c0.65": {
+    "tokens": 400,
+    "rounds": 90,
+    "committed": 3.3,
+    "tps": 60.0
+  },
+  "nothink_dyn7_c0.25": {
+    "tokens": 400,
+    "rounds": 155,
+    "committed": 2.46,
+    "tps": 60.0
+  },
+  "nothink_dyn7_c0.4": {
+    "tokens": 400,
+    "rounds": 136,
+    "committed": 2.41,
+    "tps": 53.2
+  },
+  "nothink_dyn7_c0.5": {
+    "tokens": 400,
+    "rounds": 101,
+    "committed": 2.7,
+    "tps": 51.1
+  },
+  "nothink_dyn7_c0.65": {
+    "tokens": 400,
+    "rounds": 85,
+    "committed": 2.48,
+    "tps": 43.4
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "dense_nodefault": {
+    "round_ms": 23.1,
+    "tps": 43.2
+  },
+  "ndt1": {
+    "rounds": 128,
+    "committed_per_round": 0.72,
+    "round_ms": 37.7,
+    "draft_ms": 11.1,
+    "gen_ms": 26.9,
+    "tps": 45.6
+  },
+  "ndt4": {
+    "rounds": 89,
+    "committed_per_round": 1.47,
+    "round_ms": 38.8,
+    "draft_ms": 11.1,
+    "gen_ms": 28.2,
+    "tps": 63.7
+  },
+  "ndt8": {
+    "rounds": 94,
+    "committed_per_round": 1.34,
+    "round_ms": 41.0,
+    "draft_ms": 10.6,
+    "gen_ms": 30.8,
+    "tps": 57.1
+  },
+  "ndt15": {
+    "rounds": 82,
+    "committed_per_round": 1.68,
+    "round_ms": 44.1,
+    "draft_ms": 10.7,
+    "gen_ms": 33.9,
+    "tps": 60.8
+  }
+}
