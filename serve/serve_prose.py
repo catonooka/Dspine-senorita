@@ -47,11 +47,11 @@ def build_generator(lane, dynamic, conf):
     config = Config.from_directory(os.path.expanduser(MODEL_DIR))
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=32768, max_history=16, max_batch_size=1,
+    cache = Cache(model, max_num_tokens=122880, max_history=16, max_batch_size=1,
                   recurrent_dtype=torch.half)
     draft_config = Config.from_directory(os.path.expanduser(drafter_dir))
     draft_model = Model.from_config(draft_config, component="text")
-    draft_cache = Cache(draft_model, max_num_tokens=32768, max_history=16, max_batch_size=1,
+    draft_cache = Cache(draft_model, max_num_tokens=122880, max_history=16, max_batch_size=1,
                         recurrent_dtype=torch.half)
     draft_model.load(progressbar=False, max_batch_size=1, autosplit_no_forward=True,
                      max_chunk_size=2048)
@@ -135,7 +135,15 @@ class Server:
     def embed_image(self, pil_image):
         vm = self._get_vision()
         with self.lock:
-            return vm.get_image_embeddings(tokenizer=self.tokenizer, image=pil_image)
+            ie = vm.get_image_embeddings(tokenizer=self.tokenizer, image=pil_image)
+        # 128K fp16 KV pool leaves no room to keep the tower resident:
+        # unload after embed (3s reload per image request)
+        with self.vision_lock:
+            if self.vision_model is not None:
+                self.vision_model.unload()
+                self.vision_model = None
+                torch.cuda.empty_cache()
+        return ie
 
     @staticmethod
     def extract_images(messages):
@@ -308,10 +316,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except torch.cuda.OutOfMemoryError:
+                sse({"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
+                self.wfile.write(b"0\r\n\r\n")
         else:
-            text, tps, n = SRV.generate(messages, max_tokens, temperature,
-                                        enable_thinking=enable_thinking,
-                                        reasoning_effort=reasoning_effort)
+            try:
+                text, tps, n = SRV.generate(messages, max_tokens, temperature,
+                                            enable_thinking=enable_thinking,
+                                            reasoning_effort=reasoning_effort)
+            except torch.cuda.OutOfMemoryError:
+                self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
+                return
             self._json(200, {
                 "id": "cmpl-prose", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
