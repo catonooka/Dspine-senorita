@@ -129,3 +129,24 @@ available for comparison; `--no-dynamic` for static.
 3. Stacked: graph + dynamic + tree → think projected ~95–105 (projection, not measured).
 4. 120 t/s creative prose needs ~4.8 committed/round — no current drafter predicts
    creative fiction at that rate; the honest ceiling without a better drafter is lower.
+
+---
+
+# SpineCamp: 120 prose / 200 code push (2026-11-12, DSpine only)
+
+Goal: EXL3 4bpw target, single 3090, DSpine drafter only (no DFlash2), vision+thinking on.
+Bench: 400 tok greedy, GPU1 locked 350W/1770/9501, DSpine-EXL3-5.0bpw-h8, window 15.
+
+## Camp 1 — variant grid (spinecamp1.json)
+
+| Variant | Code t/s | committed | Story t/s | committed |
+|---|---:|---:|---:|---:|
+| static15 | 121.2 | 5.48 | 50.1 | 2.30 |
+| dyn c0.25 | **163.8** | 7.55 | 59.5 | 2.72 |
+| static15 + hyb8 | 152.6 | 7.14 | **62.1** | 2.86 |
+| static15 + hyb16 | 150.0 | 7.02 | 54.0 | 2.48 |
+| dyn + hyb8 | 145.4 | 6.78 | 58.2 | 2.68 |
+
+Laws: dynamic verify dominates code (+35% over static, 53 rounds); n-gram hybrid helps
+prose only as STATIC+hyb8 (+4.4%); hybrid and dynamic stack NEGATIVELY (n-gram drafts
+disagree with truncation policy, wasted verify width); hyb16 too wide for prose.
