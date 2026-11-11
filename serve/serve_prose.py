@@ -26,6 +26,13 @@ sys.path.insert(0, os.path.expanduser("~/exl3_pipeline/exllamav3"))
 import torch
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 
+VISION_ENABLED = True
+try:
+    from PIL import Image
+    import base64, io, urllib.request
+except ImportError:
+    VISION_ENABLED = False
+
 LANES = {
     "dflash2":     ("~/exl3_pipeline/output_exl3/Drafter-DFlash2-EXL3-5.0bpw-h8", 7),
     "dflash2-bf16":("~/exl3_pipeline/raw_dflash2", 7),
@@ -60,17 +67,23 @@ def build_generator(lane, dynamic, conf):
     return gen, tokenizer
 
 
-def chat_prompt(messages):
-    """Qwen chat template."""
+def chat_prompt(messages, embeddings=None):
+    """Qwen chat template; image aliases (text_alias) spliced before the text."""
+    aliases = [e.text_alias for e in (embeddings or [])]
     parts = []
     sysmsg = [m["content"] for m in messages if m.get("role") == "system"]
     if sysmsg:
         parts.append(f"<|im_start|>system\n{sysmsg[0]}<|im_end|>\n")
+    first_user = True
     for m in messages:
         if m.get("role") == "system":
             continue
         role = "user" if m.get("role") != "assistant" else "assistant"
-        parts.append(f"<|im_start|>{role}\n{m['content']}<|im_end|>\n")
+        body = m["content"]
+        if role == "user" and first_user and aliases:
+            body = "\n".join(aliases) + "\n" + body
+            first_user = False
+        parts.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
     return "".join(parts)
 
@@ -82,19 +95,75 @@ class Server:
         self.gen, self.tokenizer = build_generator(lane, dynamic, conf)
         self.lock = threading.Lock()
         self.eos = [self.tokenizer.eos_token_id, self.tokenizer.single_id("<|im_end|>")]
+        self.vision_model = None
+        self.vision_lock = threading.Lock()
         print(f"[serve] lane={lane} window={LANES[lane][1]} dynamic={dynamic} conf={conf} "
               f"loaded in {time.time()-t0:.0f}s", flush=True)
         # warmup
         self.generate([{"role": "user", "content": "Say OK."}], 8)
         print("[serve] warmup done", flush=True)
 
+    # ---------- vision ----------
+
+    def _get_vision(self):
+        with self.vision_lock:
+            if self.vision_model is None:
+                print("[serve] loading vision tower (on-demand, stays resident)", flush=True)
+                t0 = time.time()
+                vm = Model.from_config(self.gen.model.config, component="vision")
+                vm.load()
+                self.vision_model = vm
+                print(f"[serve] vision tower loaded in {time.time()-t0:.0f}s", flush=True)
+            return self.vision_model
+
+    def embed_image(self, pil_image):
+        vm = self._get_vision()
+        with self.lock:
+            return vm.get_image_embeddings(tokenizer=self.tokenizer, image=pil_image)
+
+    @staticmethod
+    def extract_images(messages):
+        """Return (text_messages, images) — OpenAI multimodal content arrays supported."""
+        out_msgs, images = [], []
+        for m in messages:
+            if isinstance(m.get("content"), list):
+                text_parts = []
+                for part in m["content"]:
+                    if part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif part.get("type") == "image_url" and VISION_ENABLED:
+                        url = part.get("image_url", {}).get("url", "")
+                        images.append(url)
+                m2 = dict(m)
+                m2["content"] = "\n".join(text_parts)
+                out_msgs.append(m2)
+            else:
+                out_msgs.append(m)
+        return out_msgs, images
+
+    @staticmethod
+    def load_image(url):
+        if url.startswith("data:"):
+            header, b64 = url.split(",", 1)
+            raw = base64.b64decode(b64)
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        if url.startswith("http://") or url.startswith("https://"):
+            with urllib.request.urlopen(url, timeout=30) as r:
+                return Image.open(io.BytesIO(r.read())).convert("RGB")
+        return Image.open(url).convert("RGB")
+
+    # ---------- generation ----------
+
     def generate(self, messages, max_tokens, temperature=0.0):
         """Full generation, returns (text, tps, n_tokens)."""
-        prompt = chat_prompt(messages)
-        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+        messages, img_urls = self.extract_images(messages)
+        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
+        prompt = chat_prompt(messages, embeddings)
+        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
+                                          embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
                   decode_special_tokens=True, temperature=temperature,
-                  stop_conditions=self.eos)
+                  stop_conditions=self.eos, embeddings=embeddings or None)
         with self.lock:
             self.gen.enqueue(job)
             out, t0 = "", None
@@ -110,11 +179,14 @@ class Server:
 
     def generate_stream(self, messages, max_tokens, temperature=0.0, emit=None):
         """Streaming generation; emit(text_delta) called per chunk. Returns stats."""
-        prompt = chat_prompt(messages)
-        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+        messages, img_urls = self.extract_images(messages)
+        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
+        prompt = chat_prompt(messages, embeddings)
+        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
+                                          embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
                   decode_special_tokens=True, temperature=temperature,
-                  stop_conditions=self.eos)
+                  stop_conditions=self.eos, embeddings=embeddings or None)
         with self.lock:
             self.gen.enqueue(job)
             out, t0 = "", None
