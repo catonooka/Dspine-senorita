@@ -1,0 +1,50 @@
+{
+  "code_dyn_c035": {
+    "tokens": 400,
+    "rounds": 58,
+    "committed": 6.9,
+    "tps": 153.6
+  },
+  "code_dyn_c035_sp": {
+    "tokens": 400,
+    "rounds": 71,
+    "committed": 5.63,
+    "tps": 121.6
+  },
+  "code_dyn_c05": {
+    "tokens": 400,
+    "rounds": 73,
+    "committed": 5.48,
+    "tps": 118.9
+  },
+  "code_dyn_c05_sp": {
+    "tokens": 400,
+    "rounds": 63,
+    "committed": 6.35,
+    "tps": 135.8
+  },
+  "code_dyn_c025_sp": {
+    "tokens": 400,
+    "rounds": 58,
+    "committed": 6.9,
+    "tps": 147.1
+  },
+  "story_stat_hyb8": {
+    "tokens": 400,
+    "rounds": 140,
+    "committed": 2.86,
+    "tps": 62.4
+  },
+  "story_stat_hyb8_sp": {
+    "tokens": 400,
+    "rounds": 140,
+    "committed": 2.86,
+    "tps": 62.4
+  },
+  "story_dyn_c025_sp": {
+    "tokens": 400,
+    "rounds": 167,
+    "committed": 2.4,
+    "tps": 52.4
+  }
+}

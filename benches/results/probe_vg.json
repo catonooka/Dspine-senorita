@@ -1,0 +1,34 @@
+{
+  "story_eager": {
+    "sha": "767cd8f161751eed",
+    "prefix": "<think>\\nThe user is asking me to tell a short story about a lighthouse keeper who finds something unexpected washed up o",
+    "tokens": 400,
+    "rounds": 168,
+    "committed": 2.38,
+    "tps": 53.5
+  },
+  "story_graph": {
+    "sha": "db9c164041417481",
+    "prefix": "<think>\\nThe user is asking me to tell a short story about a lighthouse keeper who finds something unexpected washed up o",
+    "tokens": 400,
+    "rounds": 149,
+    "committed": 2.68,
+    "tps": 59.1
+  },
+  "code_eager": {
+    "sha": "6b4d1ee3c021f7c1",
+    "prefix": "<think>\\nThe user wants a complete, production-grade async task scheduler library in Python. Let me break down all the re",
+    "tokens": 400,
+    "rounds": 74,
+    "committed": 5.41,
+    "tps": 115.0
+  },
+  "code_graph": {
+    "sha": "8154235b709b455e",
+    "prefix": "<think>\\nThe user wants a complete, production-grade Python async task scheduler library. Let me break down the requireme",
+    "tokens": 400,
+    "rounds": 69,
+    "committed": 5.8,
+    "tps": 124.0
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "h16_code_dyn_c025": {
+    "tokens": 400,
+    "rounds": 53,
+    "committed": 7.55,
+    "tps": 165.3
+  },
+  "h16_story_stat_hyb8": {
+    "tokens": 400,
+    "rounds": 157,
+    "committed": 2.55,
+    "tps": 56.0
+  }
+}

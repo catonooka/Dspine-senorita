@@ -150,3 +150,41 @@ Bench: 400 tok greedy, GPU1 locked 350W/1770/9501, DSpine-EXL3-5.0bpw-h8, window
 Laws: dynamic verify dominates code (+35% over static, 53 rounds); n-gram hybrid helps
 prose only as STATIC+hyb8 (+4.4%); hybrid and dynamic stack NEGATIVELY (n-gram drafts
 disagree with truncation policy, wasted verify width); hyb16 too wide for prose.
+
+## Camp 2 — confidence + sparse head (spinecamp2.json)
+
+| Variant | Code t/s | Story t/s |
+|---|---:|---:|
+| dyn c0.35 | 153.6 | — |
+| dyn c0.25 + sparse32k | 147.1 | 61.9 (dyn) |
+| dyn c0.35 + sparse32k | 121.6 | — |
+| static15 + hyb8 + sparse32k | — | 62.4 |
+
+Laws: sparse draft head REJECTED — costs code −10% (subset drops good draft tokens),
+neutral on prose. Confidence: c0.25 stays optimal (higher targets truncate too eagerly).
+
+## Camp 3 — fp16 draft head (Drafter-DSpine-EXL3-5.0bpw-h16, spinecamp3.json)
+
+Code 165.3 (+0.9% ≈ noise, committed identical 7.55), story 56.0 (worse, 2.55 vs 2.86
+committed). REJECTED — head precision is not DSpine's acceptance bottleneck. h8 stays.
+
+## Camp 4 — noise band + verify CUDA graph (spinecamp4.json, vg_probe2.log)
+
+3 reps × 400 tok, same process, GPU1 locked 350W/1770:
+- code static15: 123.4 / 136.7 / 141.9 → mean 134.0
+- code dyn c0.25: 111.7 / 143.4 / 138.0 → mean 131.0
+- story static15+hyb8: 49.3 / 57.8 / 64.7 → mean 57.3
+
+Static vs dynamic on code is a WASH once repeated (camp1's 163.8 = single-rep
+trajectory luck). Spread source: kernel nondeterminism → near-tie flips → different
+greedy trajectories → different acceptance profiles (committed 5.2-6.7 code, 2.3-3.0
+story across reps of the SAME config).
+
+**Verify-pass CUDA graph: conclusively NEGATIVE.** Implementation exists
+(DSPINE_VERIFY_GRAPH=1 in generator.py: per-(rows,pages,ids-width) lazy capture with
+static staging arenas; the arena tensors ARE refreshed in place each round, so the
+design was sound). Capture dies with torch AcceleratorError inside the target forward
+— an allocation/op not legal under stream capture (paged-cache growth during verify).
+The apparent +10% in early A/Bs was acceptance-trajectory noise (graphs=0 at exit;
+round_ms identical 45.5 vs 45.7). LAW: verify pass not graphable without moving cache
+growth out of the captured region — days of surgery for ~10ms/round.
