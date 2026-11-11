@@ -327,6 +327,9 @@ class Handler(BaseHTTPRequestHandler):
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
+            except AssertionError as e:
+                self._json(400, {"error": f"context pool exceeded: {e}"})
+                return
             self._json(200, {
                 "id": "cmpl-prose", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
@@ -340,7 +343,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8900)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--lane", default="dflash2",
+    ap.add_argument("--lane", default="dspine",
                     choices=list(LANES) + ["all"])
     ap.add_argument("--no-dynamic", action="store_true")
     ap.add_argument("--conf", type=float, default=0.25)
