@@ -389,3 +389,30 @@ image right after a crash worked, proving the server recovered between storms.
   self-healing reset — measured best: prose w8 60.2 t/s, code w15 143.9 t/s.
 - Production relaunched: `--window 8` (prose-majority traffic); send
   `"draft_window": 15` for code-heavy agent tasks.
+
+## Blocker 1 — two-world diff night 2 (2026-11-13 early)
+Method: run identical generation twice (world E = all-eager GPU1, world G = verify
+graphs GPU2), hash layer-0 state (ring/row0/row1/KV/spec_conv/spec_beta) after
+every round; no in-check eager (pollution-free, unlike STATECMP).
+
+Findings ladder:
+1. WITHOUT the replay-branch bookkeeping, ring/row0 FREEZE from the first pure
+   replay round -> FIX: call advance_recurrent_states(batch_ids, params, model)
+   after every replay (the forward's host bookkeeping: position, last_history,
+   spec_row, spec_shape, post_advance — the commit/rewind machinery depends on
+   it and silently no-ops when stale). State moves again after the fix.
+2. With the fix: capture rounds (record + replay-once) are BIT-EXACT vs eager
+   (state hashes match every capture round, deterministic across runs). First
+   STEADY-STATE replay breaks: acceptance collapses to ~1, spec_beta freezes at
+   exactly the capture-round value (514.81/524.98 across runs), ring freezes
+   soon after; KV pages stay correct; sc (spec_conv) keeps moving (commit still
+   consuming). Both A- and B-parity graphs broken in steady state.
+3. Interpretation: replays re-execute kernels whose non-tensor inputs (scalar
+   kernel args derived from .item()/int() reads — positions, seqlens, offsets)
+   were baked at record time; tensor-arg reads (arena, slots, ring, rows) are
+   live. Capture rounds are always correct because the baked values ARE that
+   round's values — which also explains why earlier "capture-round bit-exact"
+   checks passed while steady replays diverged.
+NEXT: audit the verify forward path for scalar kernel args (grep .item()/int(
+in gated_delta_net chain path, attn/cache get_kv, conv1d update) and convert
+them to tensor-driven args (the planned static-state capture surgery).
