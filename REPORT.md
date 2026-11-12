@@ -508,3 +508,18 @@ on this exact quant, with all campaign patches in the tree, graphs on or off.
 This is the independent correctness proof K8V8 nondeterminism denied the two-world
 method. Speed verdict for graphs stays workload-dependent (chat/code win, one-shot
 short prose -5%); adoption decision pending.
+
+## Production = graphs + K8V8 (user decision 2026-11-13); English peak numbers
+GPU0 now runs lane dspine w8 + K8V8 pool 163840 + verify-graph env matrix
+(DSPINE_GRAPH=1 DSPINE_VERIFY_GRAPH=1 EXL3_GDN_FORCE_TORCH=1 EXL3_GRAPH_SAFE=1
+EXL3_BC_ATTN=0). Upstream lossless suite 5/5 covers correctness; speed verdict
+accepted with the one-shot/VN trade-offs. English PEAK t/s (bias-tuned prompts,
+temp 0, 2 reps, warm):
+- prose (story continuation): 82.1
+- code (boilerplate lambdas): 124.2
+- structure (repetitive JSON): 193.6
+- math (times table drill): 196.8
+Typical harder prompts (rich creative prose / full modules / large varied JSON /
+multi-part derivations): prose 59-60, code 110, structure 106, math 125.
+Peaks approach the acceptance ceiling of window 8; further headroom = P2
+(capture-safe fused GDN removes FORCE_TORCH), P3 (draft-phase graphs), P4 (trees).
