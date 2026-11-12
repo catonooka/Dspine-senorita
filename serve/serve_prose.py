@@ -43,8 +43,9 @@ LANES = {
 MODEL_DIR = "~/exl3_pipeline/output_exl3/Model-27B-EXL3-4.0bpw-h8"
 
 
-def build_generator(lane, dynamic, conf):
-    drafter_dir, window, pool = LANES[lane]
+def build_generator(lane, dynamic, conf, window=None):
+    drafter_dir, lane_window, pool = LANES[lane]
+    window = window or lane_window  # --window override (bw_reps per-class best)
     config = Config.from_directory(os.path.expanduser(MODEL_DIR))
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
@@ -312,16 +313,17 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
 
 
 class Server:
-    def __init__(self, lane, dynamic, conf):
+    def __init__(self, lane, dynamic, conf, window=None):
         self.lane = lane
         print(f"[serve] loading target {MODEL_DIR}", flush=True)
         t0 = time.time()
-        self.gen, self.tokenizer = build_generator(lane, dynamic, conf)
+        self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window)
+        self.default_window = self.gen.num_draft_tokens
         self.lock = threading.Lock()
         self.eos = [self.tokenizer.eos_token_id, self.tokenizer.single_id("<|im_end|>")]
         self.vision_model = None
         self.vision_lock = threading.Lock()
-        print(f"[serve] lane={lane} window={LANES[lane][1]} dynamic={dynamic} conf={conf} "
+        print(f"[serve] lane={lane} window={self.gen.num_draft_tokens} (default {self.default_window}) dynamic={dynamic} conf={conf} "
               f"loaded in {time.time()-t0:.0f}s", flush=True)
         # warmup (think_rescue off: keep boot fast, answer completeness irrelevant)
         self.generate([{"role": "user", "content": "Say OK."}], 8, think_rescue=False)
@@ -384,6 +386,25 @@ class Server:
                 return Image.open(io.BytesIO(r.read())).convert("RGB")
         return Image.open(url).convert("RGB")
 
+    def prepare_images(self, messages):
+        """Decode + embed ALL images up front (Bug 8). A corrupt/truncated image
+        raises ImageDataError(messages_index) BEFORE any response bytes go out,
+        so the client gets a clean 400 instead of a dead connection it can only
+        blind-retry with the same bad bytes (the ECONNRESET storm loop)."""
+        pairs = []
+        for i, m in enumerate(messages):
+            if isinstance(m.get("content"), list):
+                for part in m["content"]:
+                    if part.get("type") == "image_url" and VISION_ENABLED:
+                        pairs.append((i, part.get("image_url", {}).get("url", "")))
+        embeddings = []
+        for i, url in pairs:
+            try:
+                embeddings.append(self.embed_image(self.load_image(url)))
+            except Exception as e:
+                raise ImageDataError(i, e)
+        return embeddings or None
+
     # ---------- generation ----------
 
     def _gen_pass(self, input_ids, max_new_tokens, sampler, embeddings, emit=None,
@@ -415,7 +436,8 @@ class Server:
 
     def generate(self, messages, max_tokens, temperature=0.0, emit=None,
                  enable_thinking=True, reasoning_effort="xhigh", tools=None,
-                 think_rescue=True, top_p=1.0, top_k=0, min_p=0.0, min_tokens=0):
+                 think_rescue=True, top_p=1.0, top_k=0, min_p=0.0, min_tokens=0,
+                 embeddings=None):
         """Full generation (streaming via emit(text_delta) if given).
         Returns (text, tps, total_completion_tokens, hit_cap_of_last_pass).
 
@@ -431,8 +453,9 @@ class Server:
         run a bounded continuation pass that produces the actual answer;
         deltas keep streaming and completion_tokens are summed across passes.
         Opt out per request with {"think_rescue": false}."""
-        messages, img_urls = self.extract_images(messages)
-        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls] or None
+        messages, _ = self.extract_images(messages)
+        if embeddings is None:
+            embeddings = self.prepare_images(messages)  # may raise ImageDataError
         prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
                              tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
@@ -474,6 +497,13 @@ class Server:
 
 
 SRV = None
+
+
+class ImageDataError(Exception):
+    """An image attached to messages[index] failed to load/decode (Bug 8)."""
+    def __init__(self, index, cause):
+        super().__init__(f"invalid image data at messages[{index}]: {cause}")
+        self.index = index
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -553,7 +583,26 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(th, dict) and th.get("type") == "disabled":
             enable_thinking = False
         model_id = "qwen3.8-27b-exl3-4bpw-prose"
+        # per-request drafter window (bw_reps: prose w8 60.2 t/s, code w15 143.9);
+        # launch default set by --window. Validated 1..31.
+        dw = req.get("draft_window")
+        draft_window = max(1, min(31, int(dw))) if dw else None
         t0 = time.time()
+
+        # Bug 8: decode/validate ALL images BEFORE any bytes go out — a corrupt
+        # image becomes a clean 400 instead of a mid-stream dead connection.
+        try:
+            embeddings = SRV.prepare_images(messages)
+        except ImageDataError as e:
+            self._json(400, {"error": f"invalid image data at messages[{e.index}]"})
+            return
+        except Exception as e:
+            self._json(500, {"error": f"image processing failed: {e}"})
+            return
+
+        # self-healing override: reset to default, then apply per-request width
+        SRV.gen.num_draft_tokens = draft_window or getattr(SRV, "default_window",
+                                                           SRV.gen.num_draft_tokens)
 
         if stream:
             self.send_response(200)
@@ -599,7 +648,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit=lambda d: flt.feed(d),
                     enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
                     tools=tools, think_rescue=think_rescue, top_p=top_p, top_k=top_k,
-                    min_p=min_p, min_tokens=min_tokens)
+                    min_p=min_p, min_tokens=min_tokens, embeddings=embeddings)
                 flt.flush()
                 chunk("", finish=finish_reason(capped, flt.has_tools))
                 sse({"stats": {"tokens": n, "tps": round(tps, 1),
@@ -610,6 +659,15 @@ class Handler(BaseHTTPRequestHandler):
             except torch.cuda.OutOfMemoryError:
                 sse({"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 self.wfile.write(b"0\r\n\r\n")
+            except Exception as e:
+                # Bug 8 principle: a lane-internal error must surface as data,
+                # never as a dead connection the client can only blind-retry.
+                print(f"[serve] stream error: {type(e).__name__}: {e}", flush=True)
+                try:
+                    sse({"error": f"{type(e).__name__}: {e}"})
+                    self.wfile.write(b"0\r\n\r\n")
+                except Exception:
+                    pass
         else:
             try:
                 text, tps, n, capped = SRV.generate(messages, max_tokens, temperature,
@@ -619,12 +677,18 @@ class Handler(BaseHTTPRequestHandler):
                                                     think_rescue=think_rescue,
                                                     top_p=top_p, top_k=top_k,
                                                     min_p=min_p,
-                                                    min_tokens=min_tokens)
+                                                    min_tokens=min_tokens,
+                                                    embeddings=embeddings)
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
             except AssertionError as e:
                 self._json(400, {"error": f"context pool exceeded: {e}"})
+                return
+            except Exception as e:
+                # Bug 8 principle: JSON error, never a killed connection
+                print(f"[serve] request error: {type(e).__name__}: {e}", flush=True)
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
                 return
             content, calls = split_tool_calls(text)
             if calls:
@@ -655,9 +719,11 @@ def main():
                     choices=list(LANES) + ["all"])
     ap.add_argument("--no-dynamic", action="store_true")
     ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--window", type=int, default=None,
+                    help="drafter window override (bw_reps: prose w8, code w15)")
     args = ap.parse_args()
     global SRV
-    SRV = Server(args.lane, not args.no_dynamic, args.conf)
+    SRV = Server(args.lane, not args.no_dynamic, args.conf, args.window)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] listening on http://{args.host}:{args.port}/v1/chat/completions", flush=True)
     httpd.serve_forever()

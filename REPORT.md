@@ -362,3 +362,30 @@ Top-7 sum ~29ms GPU/round vs measured round 42-50ms => ~13-20ms host/gap overhea
   recomputes from staging) or fix the handoff directly.
 - Trace segmentation (segment_trace.py): verify ~31ms pure-kernel + draft ~11ms pure-kernel;
   ~3200 launches/round total -> launch-storm overhead is a first-class target after graphs.
+
+## Bug 8 — corrupt image bytes killed the connection (ECONNRESET storms)
+2026-11-12 night. Root cause verified deterministically by the client-side
+investigation: a truncated/corrupt JPEG in `messages` crashed the server during
+image decode; the connection died with no error body; the client retried with
+the same bad bytes still in history -> repeated deaths (~10x storms). Any valid
+image right after a crash worked, proving the server recovered between storms.
+
+### Fixes (serve/serve_prose.py)
+1. **`prepare_images()`** decodes and embeds ALL images before any response
+   bytes go out (both streaming and non-streaming). A bad image raises
+   `ImageDataError(messages_index)`.
+2. Handler maps it to `HTTP 400 {"error": "invalid image data at messages[i]"}`
+   — verified live: truncated JPEG (1/3 of a real JPEG) -> 400 + server alive;
+   valid JPEG immediately after -> 200 with a correct vision answer (95.8 t/s).
+3. **Catch-all principle** (the underlying disease): every lane-internal error
+   now surfaces as data instead of a dead connection — non-streaming gets
+   `500 {"error": "<Type>: <msg>"}`, streaming gets an SSE error event + clean
+   chunked terminator. The client can finally SEE why a request failed.
+4. `embeddings` computed once and passed into `generate()` (no double decode).
+
+### Launch settings (bw_reps per-class windows applied)
+- New `--window N` CLI flag overrides the lane default drafter window.
+- New per-request `"draft_window": 8|15` field (validated 1..31) with
+  self-healing reset — measured best: prose w8 60.2 t/s, code w15 143.9 t/s.
+- Production relaunched: `--window 8` (prose-majority traffic); send
+  `"draft_window": 15` for code-heavy agent tasks.
