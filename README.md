@@ -1,5 +1,10 @@
 # Dspine-senorita
 
+By **catonooka**: [X / Twitter](https://x.com/catonooka) -
+[GitHub](https://github.com/catonooka) -
+[Hugging Face](https://huggingface.co/nguyenminhtri99) (target quant:
+[Qwen3.8-27B-EXL3-4.0bpw-h8](https://huggingface.co/catonooka/Qwen3.8-27B-EXL3-4.0bpw-h8)).
+
 Creative-prose and code decode speed for **Qwen3.8-27B EXL3 4.0bpw-h8 on a single
 RTX 3090**, drafted with **DSpine** (Tencent's parallel 5-layer drafter) - a full
 measured campaign: dynamic verification, n-gram hybrid drafting, drafter
