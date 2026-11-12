@@ -18,7 +18,7 @@ Alternate lanes:
 Usage:
   CUDA_VISIBLE_DEVICES=0 python serve_prose.py --port 8900
 """
-import argparse, json, os, sys, time, threading
+import argparse, json, os, re, sys, time, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("DSPINE_GRAPH", "1")
@@ -78,13 +78,133 @@ EFFORT_INSTRUCTIONS = {
 }
 
 
-def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effort="xhigh"):
+def _tools_system_block(tools, effort_instr, sys_content):
+    """Reproduce the model's own chat-template tools block verbatim (XML call format)."""
+    lines = [json.dumps(t, ensure_ascii=False) for t in tools]
+    block = (
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+        + "\n".join(lines)
+        + "\n</tools>"
+        + "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+          "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+          "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+          "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+          "- Function calls MUST follow the specified format: an inner <function=...></function> block "
+          "must be nested within <tool_call></tool_call> XML tags\n"
+          "- Required parameters MUST be specified\n"
+          "- You may provide optional reasoning for your function call in natural language BEFORE the "
+          "function call, but NOT after\n"
+          "- If there is no function call available, answer the question like normal with your current "
+          "knowledge and do not tell the user about function calls\n</IMPORTANT>"
+    )
+    head = effort_instr + "\n\n" if effort_instr else ""
+    tail = "\n\n" + sys_content if sys_content else ""
+    return f"<|im_start|>system\n{head}{block}{tail}<|im_end|>\n"
+
+
+TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
+
+
+def parse_tool_block(block):
+    """Parse one <tool_call> inner block: Qwen3.8 XML format or Hermes JSON format."""
+    s = block.strip()
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+            name, args = obj.get("name", ""), obj.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"raw": args}
+            if name:
+                return {"name": name, "arguments": args}
+        except json.JSONDecodeError:
+            pass
+        return None
+    m = re.match(r"<function=(.+?)>", s)
+    if m:
+        args = {}
+        for pm in re.finditer(r"<parameter=([^\s>]+)>\n?(.*?)\n?</parameter>", s, re.S):
+            args[pm.group(1)] = pm.group(2)
+        return {"name": m.group(1).strip(), "arguments": args}
+    return None
+
+
+def split_tool_calls(text):
+    """Non-stream: (clean_content, [calls]) — strips tool_call blocks from content."""
+    calls, out, pos = [], [], 0
+    while True:
+        i = text.find(TOOL_OPEN, pos)
+        if i < 0:
+            break
+        j = text.find(TOOL_CLOSE, i)
+        end = j if j >= 0 else len(text)
+        out.append(text[pos:i])
+        c = parse_tool_block(text[i + len(TOOL_OPEN):end])
+        if c:
+            calls.append(c)
+        pos = end + len(TOOL_CLOSE) if j >= 0 else len(text)
+    out.append(text[pos:])
+    return "".join(out).strip("\n"), calls
+
+
+class ToolStreamFilter:
+    """Streaming router: tool_call blocks -> tool_calls deltas, everything else -> content."""
+
+    def __init__(self, emit_content, emit_tool):
+        self.buf, self.inside = "", False
+        self._ec, self._et = emit_content, emit_tool
+        self.has_tools = False
+
+    def feed(self, delta):
+        self.buf += delta
+        while True:
+            if not self.inside:
+                i = self.buf.find(TOOL_OPEN)
+                if i >= 0:
+                    if self.buf[:i]:
+                        self._ec(self.buf[:i])
+                    self.buf = self.buf[i + len(TOOL_OPEN):]
+                    self.inside = True
+                    continue
+                keep = max(0, len(self.buf) - (len(TOOL_OPEN) - 1))  # hold partial open tag
+                if keep:
+                    self._ec(self.buf[:keep])
+                    self.buf = self.buf[keep:]
+                break
+            j = self.buf.find(TOOL_CLOSE)
+            if j >= 0:
+                c = parse_tool_block(self.buf[:j])
+                if c:
+                    self.has_tools = True
+                    self._et(c)
+                self.buf = self.buf[j + len(TOOL_CLOSE):]
+                self.inside = False
+                continue
+            break  # hold everything while inside a block
+
+    def flush(self):
+        if self.inside:  # unterminated block at EOS: best-effort parse
+            c = parse_tool_block(self.buf)
+            if c:
+                self.has_tools = True
+                self._et(c)
+        elif self.buf:
+            self._ec(self.buf)
+        self.buf = ""
+
+
+def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effort="xhigh",
+                tools=None):
     """Qwen chat template; image aliases spliced before text; effort + thinking per template."""
     aliases = [e.text_alias for e in (embeddings or [])]
     eff = EFFORT_INSTRUCTIONS.get(reasoning_effort, "")
     parts = []
     sysmsg = [m["content"] for m in messages if m.get("role") == "system"]
-    if sysmsg:
+    if tools:
+        parts.append(_tools_system_block(tools, eff, sysmsg[0] if sysmsg else ""))
+    elif sysmsg:
         sys = sysmsg[0] + ("\n\n" + eff if eff else "")
         parts.append(f"<|im_start|>system\n{sys}<|im_end|>\n")
     elif eff:
@@ -107,6 +227,7 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
 
 class Server:
     def __init__(self, lane, dynamic, conf):
+        self.lane = lane
         print(f"[serve] loading target {MODEL_DIR}", flush=True)
         t0 = time.time()
         self.gen, self.tokenizer = build_generator(lane, dynamic, conf)
@@ -180,11 +301,12 @@ class Server:
     # ---------- generation ----------
 
     def generate(self, messages, max_tokens, temperature=0.0,
-                 enable_thinking=True, reasoning_effort="xhigh"):
+                 enable_thinking=True, reasoning_effort="xhigh", tools=None):
         """Full generation, returns (text, tps, n_tokens)."""
         messages, img_urls = self.extract_images(messages)
         embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort)
+        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
+                             tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
@@ -204,11 +326,12 @@ class Server:
         return out, n / dt, n
 
     def generate_stream(self, messages, max_tokens, temperature=0.0, emit=None,
-                        enable_thinking=True, reasoning_effort="xhigh"):
+                        enable_thinking=True, reasoning_effort="xhigh", tools=None):
         """Streaming generation; emit(text_delta) called per chunk. Returns stats."""
         messages, img_urls = self.extract_images(messages)
         embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort)
+        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
+                             tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings or None)
         job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
@@ -250,8 +373,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [
-                {"id": "qwen3.8-27b-exl3-4bpw-prose", "object": "model"}]})
+            lane = SRV.lane if SRV else "dspine"
+            self._json(200, {"object": "list", "data": [{
+                "id": "qwen3.8-27b-exl3-4bpw-prose", "object": "model",
+                "owned_by": "catonooka",
+                "context_length": LANES[lane][2] if lane in LANES else 90112,
+                "max_completion_tokens": 32768,
+                "capabilities": {"vision": VISION_ENABLED, "tools": True,
+                                 "thinking": ["off", "low", "medium", "xhigh"],
+                                 "streaming": True}}]})
         elif self.path == "/health":
             self._json(200, {"ok": True})
         else:
@@ -271,18 +401,26 @@ class Handler(BaseHTTPRequestHandler):
         if not messages:
             self._json(400, {"error": "messages required"})
             return
-        max_tokens = int(req.get("max_tokens") or 1024)
+        # BUG1 fix: honor max_completion_tokens (OpenAI current) alongside legacy
+        # max_tokens; whichever is present wins, max_completion_tokens on ties.
+        mct, mt = req.get("max_completion_tokens"), req.get("max_tokens")
+        max_tokens = int(mct if mct is not None else (mt if mt is not None else 1024))
+        max_tokens = max(1, min(max_tokens, 32768))
         temperature = float(req.get("temperature") or 0.0)
         temperature = 0.0 if temperature < 1e-4 else temperature
         stream = bool(req.get("stream"))
+        tools = req.get("tools") or None
         # thinking controls: OpenAI-style reasoning_effort/enable_thinking +
-        # z.ai-style thinking.type parity
+        # z.ai-style thinking.type parity; "none" = alias for thinking off
         reasoning_effort = req.get("reasoning_effort") or "xhigh"
+        if reasoning_effort == "none":
+            reasoning_effort, enable_thinking = "medium", False
+        else:
+            enable_thinking = req.get("enable_thinking", True)
         if reasoning_effort not in ("xhigh", "medium", "low"):
             self._json(400, {"error": f"Unexpected reasoning effort {reasoning_effort}. "
                                       "Supported types are xhigh (default), medium, and low."})
             return
-        enable_thinking = req.get("enable_thinking", True)
         th = req.get("thinking")
         if isinstance(th, dict) and th.get("type") == "disabled":
             enable_thinking = False
@@ -305,13 +443,36 @@ class Handler(BaseHTTPRequestHandler):
                 sse({"id": "cmpl-prose", "object": "chat.completion.chunk",
                      "choices": [{"index": 0, "delta": {"content": delta_text},
                                   "finish_reason": finish}]})
+
+            def chunk_tool(idx, call):
+                sse({"id": "cmpl-prose", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0,
+                                  "delta": {"tool_calls": [{
+                                      "index": idx, "type": "function",
+                                      "id": "call_" + uuid.uuid4().hex[:24],
+                                      "function": {"name": call["name"],
+                                                   "arguments": json.dumps(call["arguments"])}}]},
+                                  "finish_reason": None}]})
+
+            def finish_reason(n, has_tools):
+                if has_tools:
+                    return "tool_calls"
+                return "length" if n >= max_tokens else "stop"
+
             try:
                 chunk("")
+                tool_idx = [0]
+                flt = ToolStreamFilter(
+                    emit_content=lambda d: chunk(d),
+                    emit_tool=lambda c: (chunk_tool(tool_idx[0], c),
+                                         tool_idx.__setitem__(0, tool_idx[0] + 1)))
                 text, tps, n = SRV.generate_stream(
                     messages, max_tokens, temperature,
-                    emit=lambda d: chunk(d),
-                    enable_thinking=enable_thinking, reasoning_effort=reasoning_effort)
-                chunk("", finish="stop")
+                    emit=lambda d: flt.feed(d),
+                    enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+                    tools=tools)
+                flt.flush()
+                chunk("", finish=finish_reason(n, flt.has_tools))
                 sse({"stats": {"tokens": n, "tps": round(tps, 1),
                                "wall_s": round(time.time() - t0, 2)}})
                 self.wfile.write(b"0\r\n\r\n")
@@ -324,17 +485,30 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 text, tps, n = SRV.generate(messages, max_tokens, temperature,
                                             enable_thinking=enable_thinking,
-                                            reasoning_effort=reasoning_effort)
+                                            reasoning_effort=reasoning_effort,
+                                            tools=tools)
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
             except AssertionError as e:
                 self._json(400, {"error": f"context pool exceeded: {e}"})
                 return
+            content, calls = split_tool_calls(text)
+            if calls:
+                finish = "tool_calls"
+                tool_calls = [{"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                               "function": {"name": c["name"],
+                                            "arguments": json.dumps(c["arguments"])}}
+                              for c in calls]
+            else:
+                finish = "length" if n >= max_tokens else "stop"
+                tool_calls = None
             self._json(200, {
                 "id": "cmpl-prose", "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                             "finish_reason": "stop"}],
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": content,
+                                         "tool_calls": tool_calls},
+                             "finish_reason": finish}],
                 "usage": {"completion_tokens": n},
                 "stats": {"tokens": n, "tps": round(tps, 1),
                           "wall_s": round(time.time() - t0, 2)}})
