@@ -78,9 +78,17 @@ EFFORT_INSTRUCTIONS = {
 }
 
 
+def _tool_json(t):
+    """Tool schema as chat_template.jinja's `tool | tojson` renders it:
+    sorted keys, default separators, HTML-safe escapes."""
+    s = json.dumps(t, sort_keys=True, separators=(", ", ": "))
+    return (s.replace("<", "\\u003c").replace(">", "\\u003e")
+             .replace("&", "\\u0026").replace("'", "\\u0027"))
+
+
 def _tools_system_block(tools, effort_instr, sys_content):
     """Reproduce the model's own chat-template tools block verbatim (XML call format)."""
-    lines = [json.dumps(t, ensure_ascii=False) for t in tools]
+    lines = [_tool_json(t) for t in tools]
     block = (
         "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
         + "\n".join(lines)
@@ -229,15 +237,24 @@ def _tool_call_xml(fn):
 
 
 def _assistant_body(m):
-    """Assistant message -> body incl. tool_call XML (chat_template.jinja layout:
-    first call after non-empty content is preceded by a blank line, after empty
-    content it starts immediately, further calls by a single newline)."""
-    body = m.get("content") or ""
-    body = body.strip() if isinstance(body, str) else str(body)
+    """Assistant message -> chat_template.jinja default rendering:
+    '<think>\\n{reasoning}\\n</think>\\n\\n{content}' (think scaffold always
+    present, reasoning from reasoning_content or extracted from a raw think
+    block embedded in content) + tool_call XML blocks."""
+    raw = m.get("content") or ""
+    raw = raw.strip() if isinstance(raw, str) else str(raw)
+    reasoning = m.get("reasoning_content") or ""
+    reasoning = reasoning.strip() if isinstance(reasoning, str) else str(reasoning)
+    i, j = raw.find(THINK_OPEN), raw.find(THINK_CLOSE)
+    if i >= 0 and j > i:  # normalize our own raw-think replay into the scaffold
+        if not reasoning:
+            reasoning = raw[i + len(THINK_OPEN):j].strip()
+        raw = (raw[:i] + raw[j + len(THINK_CLOSE):]).strip()
+    body = f"<think>\n{reasoning}\n</think>\n\n{raw}"
     calls = m.get("tool_calls") or []
-    for i, tc in enumerate(calls):
+    for k, tc in enumerate(calls):
         fn = tc.get("function") or tc
-        sep = "\n\n" if (i == 0 and body) else ("\n" if i else "")
+        sep = "\n\n" if (k == 0 and raw) else ("\n" if k else "")
         body += sep + _tool_call_xml(fn)
     return body
 
@@ -246,13 +263,14 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
                 tools=None):
     """Qwen chat template; image aliases spliced before text; effort + thinking per template."""
     aliases = [e.text_alias for e in (embeddings or [])]
-    eff = EFFORT_INSTRUCTIONS.get(reasoning_effort, "")
+    # template resolves reasoning effort only when thinking is enabled
+    eff = EFFORT_INSTRUCTIONS.get(reasoning_effort, "") if enable_thinking else ""
     parts = []
     sysmsg = [m["content"] for m in messages if m.get("role") == "system"]
     if tools:
         parts.append(_tools_system_block(tools, eff, sysmsg[0] if sysmsg else ""))
     elif sysmsg:
-        sys = sysmsg[0] + ("\n\n" + eff if eff else "")
+        sys = (eff + "\n\n" if eff else "") + sysmsg[0]
         parts.append(f"<|im_start|>system\n{sys}<|im_end|>\n")
     elif eff:
         parts.append(f"<|im_start|>system\n{eff}<|im_end|>\n")
@@ -273,7 +291,11 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
                 parts.append("<|im_end|>\n")
             continue
         role = "user" if role != "assistant" else "assistant"
-        body = _assistant_body(m) if role == "assistant" else (m.get("content") or "")
+        if role == "assistant":
+            body = _assistant_body(m)
+        else:
+            body = m.get("content") or ""
+            body = body.strip() if isinstance(body, str) else str(body)
         if role == "user" and first_user and aliases:
             body = "\n".join(aliases) + "\n" + body
             first_user = False

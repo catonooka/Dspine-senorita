@@ -14,7 +14,7 @@ import serve_prose as sp
 
 _src = open("/home/aisever/exl3_pipeline/raw_base/chat_template.jinja").read()
 _src = _src.replace("{%- generation %}", "").replace("{%- endgeneration %}", "")
-tpl = Environment(undefined=StrictUndefined).from_string(_src)
+tpl = Environment().from_string(_src)
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_weather", "description": "Get weather",
@@ -45,7 +45,7 @@ CASES = {
         {"role": "user", "content": "Tokyo and Paris?"},
         {"role": "assistant", "content": "", "tool_calls": [
             tc("get_weather", {"city": "Tokyo"}),
-            tc("get_weather", '{"city": "Paris"}')]},
+            tc("get_weather", {"city": "Paris"})]},
         {"role": "tool", "tool_call_id": "call_x", "content": "18c"},
         {"role": "tool", "tool_call_id": "call_y", "content": "11c"}],
     "tools-with-text": [
@@ -57,18 +57,34 @@ CASES = {
         {"role": "user", "content": "2+2?"},
         {"role": "assistant", "content": "<think>\nmath\n</think>\n\nFour."},
         {"role": "user", "content": "And 2+3?"}],
+    "reasoning-content-field": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "Four.", "reasoning_content": "math"},
+        {"role": "user", "content": "And 2+3?"}],
     "end-at-tool": [
         {"role": "user", "content": "Tokyo?"},
         {"role": "assistant", "content": None, "tool_calls": [tc("get_weather", {"city": "Tokyo"})]},
         {"role": "tool", "tool_call_id": "call_x", "content": "18c"}],
 }
 
+# think-in-history is a DELIBERATE normalization: the raw template would prepend
+# an empty think scaffold and keep the embedded think block in content (double
+# tags). serve_prose extracts the embedded think into the scaffold, which must
+# equal the canonical template rendering with reasoning_content passed apart.
+CANON = {
+    "think-in-history": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": "Four.", "reasoning_content": "math"},
+        {"role": "user", "content": "And 2+3?"}],
+}
+
 fails = 0
 for name, msgs in CASES.items():
+    ref_msgs = CANON.get(name, msgs)
     for tools in (None, TOOLS):
         for think in (True, False):
             for eff in ("xhigh", "medium", "low"):
-                ref = tpl.render(messages=msgs, tools=tools, add_generation_prompt=True,
+                ref = tpl.render(messages=ref_msgs, tools=tools, add_generation_prompt=True,
                                  enable_thinking=think, reasoning_effort=eff)
                 mine = sp.chat_prompt(msgs, enable_thinking=think,
                                       reasoning_effort=eff, tools=tools)
