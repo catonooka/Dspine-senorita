@@ -345,3 +345,20 @@ Per round (steady state, from chrome trace key_averages):
 Top-7 sum ~29ms GPU/round vs measured round 42-50ms => ~13-20ms host/gap overhead per round
 (launch storms + sync points), consistent with ~703-launch anatomy. Full timeline JSON kept
 (draft_trace.json 115MB) for phase segmentation (draft vs verify windows) next.
+
+## Blocker 1 — replay divergence hunt (2026-11-12 night, GPU2)
+- DBLREPLAY (two replays same round): identical logits — consistent with base-row/scratch-row design.
+- SPROBE (live conv-ring + state row hashes around replays): verify graph writes live state rows
+  per parity (row0 on A, row1 on B); conv-ring changes confounded by async commit drain.
+- LAYERDIFF: embed exact; divergence grows through stack (b2 attn ~1-4 -> final hidden ~300-500);
+  attention-side contributes more than MLP.
+- ATTNPROBE: cache_seqlens/positions arena refresh CORRECT on replay rounds; slots/parity
+  consistent via graph keys; rope passes positions tensor.
+- CONCLUSION: replay divergence lives in the GDN state-advance handoff (conv ring / scan rows /
+  spec staging) between captured verify replays and the eager commit/rewind machinery across
+  parity alternation. NEXT (single focused experiment): compare spec_* staging contents +
+  ring state after graph replay vs after eager forward for the same round; then either make
+  the verify pass stateless-in-graph (state advance only via eager rewind, which already
+  recomputes from staging) or fix the handoff directly.
+- Trace segmentation (segment_trace.py): verify ~31ms pure-kernel + draft ~11ms pure-kernel;
+  ~3200 launches/round total -> launch-storm overhead is a first-class target after graphs.
