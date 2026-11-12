@@ -43,17 +43,21 @@ LANES = {
 MODEL_DIR = "~/exl3_pipeline/output_exl3/Model-27B-EXL3-4.0bpw-h8"
 
 
-def build_generator(lane, dynamic, conf, window=None):
+def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=None):
     drafter_dir, lane_window, pool = LANES[lane]
     window = window or lane_window  # --window override (bw_reps per-class best)
     config = Config.from_directory(os.path.expanduser(MODEL_DIR))
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=pool, max_history=16, max_batch_size=1,
-                  recurrent_dtype=torch.half)
+    cache_kwargs = {}
+    if kv8:
+        from exllamav3.cache import CacheLayer_quant
+        cache_kwargs = dict(layer_type=CacheLayer_quant, k_bits=8, v_bits=8)
+    cache = Cache(model, max_num_tokens=(pool_override or pool), max_history=16, max_batch_size=1,
+                  recurrent_dtype=torch.half, **cache_kwargs)
     draft_config = Config.from_directory(os.path.expanduser(drafter_dir))
     draft_model = Model.from_config(draft_config, component="text")
-    draft_cache = Cache(draft_model, max_num_tokens=pool, max_history=16, max_batch_size=1,
+    draft_cache = Cache(draft_model, max_num_tokens=(pool_override or pool), max_history=16, max_batch_size=1,
                         recurrent_dtype=torch.half)
     draft_model.load(progressbar=False, max_batch_size=1, autosplit_no_forward=True,
                      max_chunk_size=2048)
@@ -313,11 +317,11 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
 
 
 class Server:
-    def __init__(self, lane, dynamic, conf, window=None):
+    def __init__(self, lane, dynamic, conf, window=None, kv8=False, pool_override=None):
         self.lane = lane
         print(f"[serve] loading target {MODEL_DIR}", flush=True)
         t0 = time.time()
-        self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window)
+        self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window, kv8=kv8, pool_override=pool_override)
         self.default_window = self.gen.num_draft_tokens
         self.lock = threading.Lock()
         self.eos = [self.tokenizer.eos_token_id, self.tokenizer.single_id("<|im_end|>")]
@@ -526,7 +530,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": [{
                 "id": "qwen3.8-27b-exl3-4bpw-prose", "object": "model",
                 "owned_by": "catonooka",
-                "context_length": LANES[lane][2] if lane in LANES else 90112,
+                "context_length": SRV.gen.cache.max_num_tokens,
                 "max_completion_tokens": 32768,
                 "capabilities": {"vision": VISION_ENABLED, "tools": True,
                                  "thinking": ["off", "low", "medium", "xhigh"],
@@ -710,12 +714,14 @@ def main():
     ap.add_argument("--lane", default="dspine",
                     choices=list(LANES) + ["all"])
     ap.add_argument("--no-dynamic", action="store_true")
+    ap.add_argument("--kv8", action="store_true", help="8-bit K/V quantized target KV cache")
+    ap.add_argument("--pool", type=int, default=None, help="override context pool tokens (multiple of PAGE_SIZE)")
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--window", type=int, default=None,
                     help="drafter window override (bw_reps: prose w8, code w15)")
     args = ap.parse_args()
     global SRV
-    SRV = Server(args.lane, not args.no_dynamic, args.conf, args.window)
+    SRV = Server(args.lane, not args.no_dynamic, args.conf, args.window, kv8=args.kv8, pool_override=args.pool)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] listening on http://{args.host}:{args.port}/v1/chat/completions", flush=True)
     httpd.serve_forever()

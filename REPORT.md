@@ -453,3 +453,19 @@ Note: capture currently requires EXL3_GDN_FORCE_TORCH=1 (BC fused GDN path uses
 its own nested graphs — illegal under capture) + EXL3_BC_ATTN=0; the +9/+11% is
 AFTER paying that slower-kernel penalty. Remaining upside: capture-safe fused
 GDN/attention path, drafter-side graph (P2), trees (P3).
+
+## P0 — K8V8 KV cache: DONE (2026-11-13). Context 90k -> 164k AND faster
+Engine already ships CacheLayer_quant (k_bits/v_bits 2-8 + compand); wiring is
+config-level. serve_prose.py gains `--kv8` (target cache layer_type=quant,
+k_bits=8, v_bits=8; drafter stays fp16) and `--pool N` (both caches must be the
+same token count). /v1/models context_length now reports the live pool.
+Validation on twin 3090s (same prompts, 3 reps, w8 dynamic c0.25):
+- prose 73.8 -> 83.8 t/s (+13.6%), code 112.5 -> 125.3 (+11.4%),
+  code w15 +12.2%, think-off +13.3%. K8V8 halves KV bandwidth read by every
+  verify pass, so the quantized cache is FASTER, not just smaller.
+- Quality at temp 0: code and reasoning outputs bit-identical to fp16; long
+  creative prose diverges mid-generation into an equally coherent branch
+  (typical near-lossless 8-bit profile).
+- VRAM: 22.5 GiB at 163840 tokens (fp16 pool at 90112 used 22.9 GiB).
+- 150k-token smoke: accepted, answered correctly, 210 s wall, no OOM.
+Production lane now boots with `--kv8 --pool 163840`.
