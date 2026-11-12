@@ -428,3 +428,28 @@ Prose is ~38% over the campaign-close mean (55-57). Removed the per-request
 `draft_window` field: the generator sizes buffers from the window at init, so
 switching to a larger window at runtime crashes (tensor size mismatch 8 vs 15);
 window is launch-time only (`--window`).
+
+## Blocker 1 — SOLVED (2026-11-13): verify-graph replays bit-exact and faster
+Full root-cause chain, peeled by two-world diff + zero-tests + graph DOT dumps:
+1. Replay rounds skipped the forward's host bookkeeping -> commit machinery
+   no-oped (state froze). Fix: advance_recurrent_states on every replay.
+2. Hyperconnection cross-pass relays (params["hc_pre"] carry, params["hc_pending"]
+   deferred in-place apply) baked stale capture-era tensors. Fix: relay hc_pre
+   in/out around each replay, pre-flush pending before capture, run the graph's
+   own pending after replay.
+3. THE FREEZE: the embedding table is CPU-resident; the verify forward stages
+   its (1,16,5120) fp32 output through a persistent PINNED buffer whose H2D
+   memcpy is baked into the graph. The buffer is persistent but only the eager
+   forward refilled it — every replay re-uploaded the capture round's
+   embeddings: frozen x -> frozen b/a/beta (spec_beta constant to the digit)
+   while state-dependent paths (conv staging, logits) kept moving. Fix: eager
+   refill of the pinned staging right before each replay + never evict a staged
+   buffer a live graph references (latent UAF).
+Verification: two-world diff 12/12 rounds bit-exact, generation lengths equal.
+Engine bench (w15, dynamic c0.25, 3 reps, 420-token gens):
+- prose: graph-off 45.2/52.4/54.3 (mean 50.6) -> graph-on 53.2/53.8/58.3 (mean 55.1)
+- code: graph-off 92.5/105.5/112.9 (mean 103.6) -> graph-on 109.3/112.0/122.6 (mean 114.6)
+Note: capture currently requires EXL3_GDN_FORCE_TORCH=1 (BC fused GDN path uses
+its own nested graphs — illegal under capture) + EXL3_BC_ATTN=0; the +9/+11% is
+AFTER paying that slower-kernel penalty. Remaining upside: capture-safe fused
+GDN/attention path, drafter-side graph (P2), trees (P3).
