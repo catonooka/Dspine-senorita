@@ -43,7 +43,7 @@ LANES = {
 MODEL_DIR = "~/exl3_pipeline/output_exl3/Model-27B-EXL3-4.0bpw-h8"
 
 
-def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=None):
+def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=None, hdt=0):
     drafter_dir, lane_window, pool = LANES[lane]
     window = window or lane_window  # --window override (bw_reps per-class best)
     config = Config.from_directory(os.path.expanduser(MODEL_DIR))
@@ -69,7 +69,8 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
     gen = Generator(model=model, cache=cache, tokenizer=tokenizer,
                     draft_model=draft_model, draft_cache=draft_cache,
                     num_draft_tokens=window, dynamic_draft_tokens=dynamic,
-                    draft_confidence=conf)
+                    draft_confidence=conf,
+                    hybrid_draft_tokens=hdt)
     return gen, tokenizer
 
 
@@ -317,11 +318,11 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
 
 
 class Server:
-    def __init__(self, lane, dynamic, conf, window=None, kv8=False, pool_override=None):
+    def __init__(self, lane, dynamic, conf, window=None, kv8=False, pool_override=None, hdt=0):
         self.lane = lane
         print(f"[serve] loading target {MODEL_DIR}", flush=True)
         t0 = time.time()
-        self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window, kv8=kv8, pool_override=pool_override)
+        self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window, kv8=kv8, pool_override=pool_override, hdt=hdt)
         self.default_window = self.gen.num_draft_tokens
         self.lock = threading.Lock()
         self.eos = [self.tokenizer.eos_token_id, self.tokenizer.single_id("<|im_end|>")]
@@ -719,9 +720,11 @@ def main():
     ap.add_argument("--conf", type=float, default=0.25)
     ap.add_argument("--window", type=int, default=None,
                     help="drafter window override (bw_reps: prose w8, code w15)")
+    ap.add_argument("--hdt", type=int, default=0,
+                    help="hybrid_draft_tokens: fire a long suffix-match draft when context repeats (0 = off)")
     args = ap.parse_args()
     global SRV
-    SRV = Server(args.lane, not args.no_dynamic, args.conf, args.window, kv8=args.kv8, pool_override=args.pool)
+    SRV = Server(args.lane, not args.no_dynamic, args.conf, args.window, kv8=args.kv8, pool_override=args.pool, hdt=args.hdt)
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[serve] listening on http://{args.host}:{args.port}/v1/chat/completions", flush=True)
     httpd.serve_forever()
