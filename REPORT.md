@@ -9,6 +9,24 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 
 ---
 
+## 0. Current production snapshot (updated 2026-11-13)
+
+GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on.
+English numbers (greedy, warm server, 2-3 reps):
+
+| Workload | Peak t/s | Typical t/s |
+|---|---:|---:|
+| Prose | 82.1 | 59-60 |
+| Code | 124.2 | 110 |
+| Structure (strict JSON) | 193.6 | 106 |
+| Math (step-by-step) | 196.8 | 125 |
+
+Highlights: context 90k -> 164k at equal VRAM and every class faster (+11-14%),
+because K8V8 halves the KV bytes each verify pass reads. Verify graphs add 5-13%
+on continuous chat and +11% on code. Correctness: upstream lossless suite 5/5 with
+graphs on and off, including the 8-bit-cache decode consistency case. Full story in
+the sections below (P0, P1, peak numbers).
+
 ## 1. TL;DR
 
 | Lane | Config | t/s (400-tok story) | Committed/round |
@@ -20,12 +38,12 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 | Dense floor (no drafter) | - | 42.4 | 1.0 |
 
 220-token bench scale reads higher (shorter runs, warm acceptance): DFlash2 BF16
-static ndt7 hit **75.1–83.8 t/s think / 69.0 no-think**; DSpine static **72.3 t/s think**.
+static ndt7 hit **75.1-83.8 t/s think / 69.0 no-think**; DSpine static **72.3 t/s think**.
 Never compare across run lengths - within-sweep only.
 
 **Verdict:** DFlash2 with an EXL3-quantized drafter + confidence-truncated verification
 wins BOTH prose lanes. DSpine keeps the code lane (8.16 committed/round vs 3.49 chain
-in tree mode; ~72% acceptance on code vs 14–30% on creative prose).
+in tree mode; ~72% acceptance on code vs 14-30% on creative prose).
 
 ---
 
@@ -39,18 +57,18 @@ in tree mode; ~72% acceptance on code vs 14–30% on creative prose).
   Causal Injection). No sequential drafting steps.
 - Block 16 vs DFlash2's 8 - double the speculative window per pass.
 - Acceptance length on 27B (SGLang, greedy): MT-Bench 4.48 vs DFlash2's 4.11;
-  agent benchmarks +13–33% DSpine everywhere.
-- End-to-end throughput 2.71–3.84× AR vs DFlash2's 2.33–3.17×.
-- The headline wall-clock trick: **draft always full 16, verify width DYNAMIC (4–16),
+  agent benchmarks +13-33% DSpine everywhere.
+- End-to-end throughput 2.71-3.84× AR vs DFlash2's 2.33-3.17×.
+- The headline wall-clock trick: **draft always full 16, verify width DYNAMIC (4-16),
   allocated by drafter confidence** (DSpark-style). Never pay 16-row verify on a
   low-confidence round.
 
 **What we measured** (exllamav3 port, creative story, greedy):
 
-- Acceptance: DSpine 14.0% no-think / 19.2–28.2% think vs DFlash2 22.3% / 26.0–30.0%
+- Acceptance: DSpine 14.0% no-think / 19.2-28.2% think vs DFlash2 22.3% / 26.0-30.0%
   - the acceptance ordering is **flipped** vs the paper's MT-Bench table.
 - After running the paper's exact recipe (full-16 draft + dynamic verify):
-  DSpine 60.0 t/s think vs DFlash2 64.7–67.0. Still behind.
+  DSpine 60.0 t/s think vs DFlash2 64.7-67.0. Still behind.
 
 **Why the paper advantage does not transfer:**
 
@@ -79,9 +97,9 @@ in tree mode; ~72% acceptance on code vs 14–30% on creative prose).
 | DSpine port (elpis-style attach) | 44.76 no-think / 72.3 think (220-tok) |
 | Round anatomy | prose round 44.6 ms = draft ~11 + verify ~23 + overhead; code round 69.2 ms |
 | KV 8-bit | output-safe (619-tok bit-identical); 128K ctx 169.9 t/s prefill-side |
-| Tree verification port | 6 bugs fixed → bit-comparable to chain within engine noise (prefix 4–31) |
+| Tree verification port | 6 bugs fixed → bit-comparable to chain within engine noise (prefix 4-31) |
 | Tree wall-clock | 11.9 t/s prose / 38.2 code - launch-bound (~2500 launches, ~240 ms rounds); loses wall-clock despite 2.3× committed |
-| DFlash2 prose A/B | 69.0 no-think / 75.1–83.8 think (220-tok) vs DSpine 47.8 / 55.6 |
+| DFlash2 prose A/B | 69.0 no-think / 75.1-83.8 think (220-tok) vs DSpine 47.8 / 55.6 |
 | Dynamic verify sweep | engine calibrator; DSpine best c0.25; default 0.4 worst (U-shaped) |
 | EXL3 drafters (ours, 5.0bpw-h8) | DFlash2 64.7/67.0 @400-tok = champion; DSpine flat |
 
@@ -96,7 +114,7 @@ near-ties across physical pages - byte-exactness is not achievable in-engine).
 
 Wall-clock verdict: rounds are launch-bound (~240 ms). Code tree halves rounds
 (25 vs 49, 8.16 committed vs 3.49) but still loses wall-clock. Next lever = single
-Triton tree-delta kernel (est 60–80 ms rounds), then verify CUDA-graph. Parked.
+Triton tree-delta kernel (est 60-80 ms rounds), then verify CUDA-graph. Parked.
 
 ## 5. Laws (do not re-test without a changed engine)
 
@@ -107,7 +125,7 @@ Triton tree-delta kernel (est 60–80 ms rounds), then verify CUDA-graph. Parked
   every row's head logits to decide truncation.
 - Drafter EXL3 quant changes only *which* drafts get accepted - the target still
   verifies everything, so outputs stay target-faithful (no quality gate needed).
-- DSpine high-variance acceptance on creative prose (19–28% run-to-run on identical
+- DSpine high-variance acceptance on creative prose (19-28% run-to-run on identical
   config) - single-run verdicts on it are noise.
 - 400-tok runs read ~15% lower than 220-tok runs of the same config (acceptance
   regime shift as the story deepens). Compare within one run length only.
@@ -124,9 +142,9 @@ available for comparison; `--no-dynamic` for static.
 
 ## 7. Next levers (unexercised)
 
-1. Verify-pass CUDA graph (42 ms → est 25–30 ms) - lifts every lane ~15–20%.
-2. Triton tree-delta kernel → tree mode viable (est 60–80 ms rounds).
-3. Stacked: graph + dynamic + tree → think projected ~95–105 (projection, not measured).
+1. Verify-pass CUDA graph (42 ms → est 25-30 ms) - lifts every lane ~15-20%.
+2. Triton tree-delta kernel → tree mode viable (est 60-80 ms rounds).
+3. Stacked: graph + dynamic + tree → think projected ~95-105 (projection, not measured).
 4. 120 t/s creative prose needs ~4.8 committed/round - no current drafter predicts
    creative fiction at that rate; the honest ceiling without a better drafter is lower.
 
@@ -256,22 +274,22 @@ max_history>16 to unlock TREE_CAP>15.
    rounds at full 15+1 rows even with c0.25 - DSpine per-row confidence rarely crosses
    the threshold, so the DSpark paper's mechanism doesn't engage. The earlier dyn-vs-static
    t/s differences were acceptance-trajectory luck, not saved verify work.
-3. **DSpine's draft pass costs 2× DFlash2's** (8.7–10.5 ms vs 4.3–4.4 ms, both EXL3
+3. **DSpine's draft pass costs 2× DFlash2's** (8.7-10.5 ms vs 4.3-4.4 ms, both EXL3
    5bpw-h8). 5 ACI layers at width 16 with the 248k×1024 codebook vs DFlash2's blocks.
    That is an 11% round-time penalty on every round.
-4. **Acceptance is the multiplier ceiling**: committed ≈ 2.2–3.0 on creative prose for
+4. **Acceptance is the multiplier ceiling**: committed ≈ 2.2-3.0 on creative prose for
    BOTH drafters (DSpine 2.88, DFlash2 2.83/3.04 here). Combined with the 42 ms round
-   (26 fixed verify + 9 draft + overhead) that pins prose at ~60–70 t/s regardless of
+   (26 fixed verify + 9 draft + overhead) that pins prose at ~60-70 t/s regardless of
    width/confidence tuning.
 
 ## What would actually move it
 
-- **Cut the verify fixed cost** (26 ms → 15–18 ms): hoist cache growth out of the
+- **Cut the verify fixed cost** (26 ms → 15-18 ms): hoist cache growth out of the
   captured region (camp-4 law: capture currently dies on in-forward allocation), or
-  reduce launches per round. Projected: prose ≈ 90–95, code ≈ 140–150.
+  reduce launches per round. Projected: prose ≈ 90-95, code ≈ 140-150.
 - **Halve draft cost**: extend DSPINE_GRAPH to the whole draft block (drafter is small;
   fewer capture hazards than the target). Projected: +10% round time.
-- **Acceptance on prose**: no quant knob reached it (camps 1–5); needs a better
+- **Acceptance on prose**: no quant knob reached it (camps 1-5); needs a better
   drafter or tree verification (Triton tree-delta kernel, days of work).
 
 # Blocker work log (2026-11-12, post-research)
