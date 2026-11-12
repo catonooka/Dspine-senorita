@@ -1,0 +1,58 @@
+{
+  "ds_w0": {
+    "rounds": 93,
+    "committed": 3.23,
+    "draft_ms": 9.1,
+    "gen_ms": 34.5,
+    "round_ms": 43.6,
+    "proj_tps": 74.1
+  },
+  "ds_w1": {
+    "rounds": 185,
+    "committed": 1.62,
+    "draft_ms": 8.6,
+    "gen_ms": 26.3,
+    "round_ms": 34.9,
+    "proj_tps": 46.4
+  },
+  "ds_w3": {
+    "rounds": 125,
+    "committed": 2.4,
+    "draft_ms": 8.8,
+    "gen_ms": 27.3,
+    "round_ms": 36.1,
+    "proj_tps": 66.5
+  },
+  "ds_w7": {
+    "rounds": 99,
+    "committed": 3.03,
+    "draft_ms": 9.0,
+    "gen_ms": 30.5,
+    "round_ms": 39.5,
+    "proj_tps": 76.7
+  },
+  "ds_w15": {
+    "rounds": 104,
+    "committed": 2.88,
+    "draft_ms": 8.7,
+    "gen_ms": 33.3,
+    "round_ms": 42.0,
+    "proj_tps": 68.6
+  },
+  "df2_w7_static": {
+    "rounds": 106,
+    "committed": 2.83,
+    "draft_ms": 4.3,
+    "gen_ms": 29.6,
+    "round_ms": 33.9,
+    "proj_tps": 83.5
+  },
+  "df2_w7_dyn_c025": {
+    "rounds": 141,
+    "committed": 3.04,
+    "draft_ms": 4.4,
+    "gen_ms": 27.3,
+    "round_ms": 31.7,
+    "proj_tps": 95.9
+  }
+}

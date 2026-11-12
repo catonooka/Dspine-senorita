@@ -1,0 +1,38 @@
+{
+  "story_dyn_c025": {
+    "tps": 62.2,
+    "rounds": 139,
+    "committed": 2.88,
+    "round_ms": 46.2,
+    "draft_ms": 9.0,
+    "gen_ms": 37.5,
+    "verify_width_mean": 15.0,
+    "width_hist": {
+      "13-16": 139
+    }
+  },
+  "story_static15": {
+    "tps": 46.9,
+    "rounds": 181,
+    "committed": 2.21,
+    "round_ms": 47.1,
+    "draft_ms": 8.8,
+    "gen_ms": 38.5,
+    "verify_width_mean": 15.0,
+    "width_hist": {
+      "13-16": 181
+    }
+  },
+  "code_static15": {
+    "tps": 110.5,
+    "rounds": 72,
+    "committed": 5.56,
+    "round_ms": 50.3,
+    "draft_ms": 10.5,
+    "gen_ms": 40.5,
+    "verify_width_mean": 15.0,
+    "width_hist": {
+      "13-16": 72
+    }
+  }
+}

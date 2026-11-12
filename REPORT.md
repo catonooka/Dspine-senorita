@@ -215,3 +215,61 @@ graph (✗ AcceleratorError), window sweeps, EXL3 drafter quant (✓ 5bpw-h8, se
 Still open if we ever reopen: Triton tree-delta kernel (launch-bound 240ms tree rounds
 → 60-80ms), cache-growth-outside-capture to resurrect verify graph, recurrent
 max_history>16 to unlock TREE_CAP>15.
+
+---
+
+# Why is DSpine slow here — phase anatomy + width-cost curve (2026-11-12, GPU1+GPU2)
+
+## Phase anatomy (DSpine-EXL3-5.0bpw-h8, 400 tok, why_slow1.json)
+
+| Config | t/s | round_ms | draft_ms | gen_ms | verify width used |
+|---|---:|---:|---:|---:|---|
+| story dyn c0.25 | 62.2 | 46.2 | 9.0 | 37.5 | **15.0 always (139/139 rounds full width)** |
+| story static15 | 46.9 | 47.1 | 8.8 | 38.5 | 15.0 |
+| code static15 | 110.5 | 50.3 | 10.5 | 40.5 | 15.0 |
+
+## Target verify cost vs width (why_slow2.json, story, static widths)
+
+| width | gen_ms | committed |
+|---|---:|---:|
+| w1 (2 rows) | 26.3 | 1.62 |
+| w3 | 27.3 | 2.40 |
+| w7 | 30.5 | 3.03 |
+| w15 | 33.3 | 2.88 |
+| DFlash2 w7 (ref) | 29.6 | 2.83 |
+
+## DFlash2 reference (same harness, GPU2)
+
+| Config | draft_ms | gen_ms | round_ms | proj t/s |
+|---|---:|---:|---:|---:|
+| df2 w7 static | **4.3** | 29.6 | 33.9 | 83.5 |
+| df2 w7 dyn c0.25 | **4.4** | 27.3 | 31.7 | 95.9 |
+
+## Diagnosis (four stacked reasons)
+
+1. **Verify pass is ~75% FIXED cost.** 2 rows cost 26.3 ms, 16 rows cost 33.3 ms —
+   marginal row ≈ 0.5 ms. The dense single-token floor is 23.6 ms, so nearly all of
+   the verify pass is the per-round irreducible forward (≈703 kernel launches through
+   62 layers + GDN state ops), not the drafted rows. Wider drafts are almost free;
+   narrower drafts save almost nothing.
+2. **Dynamic verify never truncates on our stack.** width histogram: 139/139 story
+   rounds at full 15+1 rows even with c0.25 — DSpine per-row confidence rarely crosses
+   the threshold, so the DSpark paper's mechanism doesn't engage. The earlier dyn-vs-static
+   t/s differences were acceptance-trajectory luck, not saved verify work.
+3. **DSpine's draft pass costs 2× DFlash2's** (8.7–10.5 ms vs 4.3–4.4 ms, both EXL3
+   5bpw-h8). 5 ACI layers at width 16 with the 248k×1024 codebook vs DFlash2's blocks.
+   That is an 11% round-time penalty on every round.
+4. **Acceptance is the multiplier ceiling**: committed ≈ 2.2–3.0 on creative prose for
+   BOTH drafters (DSpine 2.88, DFlash2 2.83/3.04 here). Combined with the 42 ms round
+   (26 fixed verify + 9 draft + overhead) that pins prose at ~60–70 t/s regardless of
+   width/confidence tuning.
+
+## What would actually move it
+
+- **Cut the verify fixed cost** (26 ms → 15–18 ms): hoist cache growth out of the
+  captured region (camp-4 law: capture currently dies on in-forward allocation), or
+  reduce launches per round. Projected: prose ≈ 90–95, code ≈ 140–150.
+- **Halve draft cost**: extend DSPINE_GRAPH to the whole draft block (drafter is small;
+  fewer capture hazards than the target). Projected: +10% round time.
+- **Acceptance on prose**: no quant knob reached it (camps 1–5); needs a better
+  drafter or tree verification (Triton tree-delta kernel, days of work).
