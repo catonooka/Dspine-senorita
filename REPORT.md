@@ -469,3 +469,24 @@ Validation on twin 3090s (same prompts, 3 reps, w8 dynamic c0.25):
 - VRAM: 22.5 GiB at 163840 tokens (fp16 pool at 90112 used 22.9 GiB).
 - 150k-token smoke: accepted, answered correctly, 210 s wall, no OOM.
 Production lane now boots with `--kv8 --pool 163840`.
+
+## P1 — verify graphs x K8V8: attempted, gate FAILED, parked pending P2 (2026-11-13)
+Engine correctness work that DID land (commit 67b1589):
+- Sparse head -inf fill boundary was a python-int slice baked into captured graphs
+  (n_active grows across rebuilds) -> pinned-int staging + masked_fill, live on replay.
+- KV8 finding that changes methodology: the quant cache kernels are run-to-run
+  NONDETERMINISTIC across processes. Proof: two identical all-eager KV8 runs diverge
+  at r3 (acc/ring). The two-world bit-exact method is therefore invalid under K8V8;
+  graph-replay correctness can only be validated end-to-end (quality + stability).
+  (fp16 cache kernels ARE deterministic - 12/12 two-world match.)
+- Probes added: DSPINE_VG_LDMOD (per-module hashes both worlds), DSPINE_SPARSE_FLAG
+  (mode pin), SHCALL/LMCALL call-site tracers, KV8-aware capture_tw.
+Server A/B (twin 3090s, w8 dynamic c0.25, 3 reps, K8V8 pool 163840):
+- K8V8 alone:    prose 83.8, code 125.3, think-off 53.7
+- K8V8 + graphs: prose 76.9 (-8%), code 133.4 (+6.5%), think-off 51.8 (-3.5%)
+Gate (>= +7% and no regressions) FAILED. Code wins, prose loses: the GDN_FORCE_TORCH
+penalty (needed for capture-legal verify graphs) hits GDN-heavy prose, and w8's short
+rounds amplify the per-round host refresh overhead (embedding staging refill, hc
+relays, advance_recurrent_states). Production stays K8V8 without graphs (prose 80-81,
+code 119-120 on GPU0). Unlock path = P2: make the fused GDN/BC path capture-safe so
+graphs stop paying the FORCE_TORCH penalty; then re-run this gate.
