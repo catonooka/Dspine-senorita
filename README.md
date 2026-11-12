@@ -1,21 +1,103 @@
-# DSpine-senorita
+# Dspine-senorita
 
-Max creative-prose decode speed for Qwen3.8-27B EXL3 4.0bpw-h8 on one RTX 3090:
-DSpine vs DFlash2 drafting, dynamic verification, EXL3 drafter re-quantization.
+Creative-prose and code decode speed for **Qwen3.8-27B EXL3 4.0bpw-h8 on a single
+RTX 3090**, drafted with **DSpine** (Tencent's parallel 5-layer drafter) — a full
+measured campaign: dynamic verification, n-gram hybrid drafting, drafter
+re-quantization (EXL3 5.0/6.0bpw, fp16 heads), sparse draft heads, and a
+verify-pass CUDA-graph attempt, on top of [exllamav3](https://github.com/turboderp/exllamav3) v1.6.6.
 
-- **REPORT.md** — the deep report: paper vs rig, measured ladder, laws, verdicts.
-- **serve/serve_prose.py** — OpenAI-compatible server, champion config default
-  (DFlash2-EXL3-5.0bpw drafter, window 7, dynamic verify, confidence 0.25).
-- **engine/** — our exllamav3 v1.6.6 campaign diff (DSpine architecture attach,
-  tree verification engine, GDN tree paths) as one patch + the two new files.
-- **benches/** — every harness that produced a reported number + raw result JSONs.
+Every number in this repo is measured on the same rig, greedy, single stream,
+GPU locked at 350 W / 1770 MHz. Run-to-run spread is stated wherever it matters.
 
-Quick start:
+## Results (400-token generations, DSpine drafter only)
 
-```bash
-CUDA_VISIBLE_DEVICES=0 ~/exl3-env/bin/python serve/serve_prose.py --port 8900
-curl -s localhost:8900/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Write a story about a lighthouse."}],"max_tokens":400}'
+| Lane | Config | Mean t/s (×3 reps) | Best single |
+|---|---|---:|---:|
+| Code | static15 or dyn c0.25 | 131–138 | 143.4 |
+| Creative prose (thinking on) | static15 + n-gram hybrid 8 | 55–57 | 64.7 |
+| Dense floor (no drafting) | — | 42.4 | — |
+
+Reference, same rig and harness (not the project default): DFlash2-EXL3-5.0bpw
+drafter reaches ~75 t/s on prose. DSpine keeps the code lane and is the project's
+default lane; both drafters ship as switchable lanes in the server.
+
+**Noise band:** ±15–20% run-to-run at identical config. Kernel nondeterminism flips
+near-tie argmaxes, which diverges the greedy trajectory, which changes speculative
+acceptance (committed/round swings 5.2–6.7 on code, 2.3–3.0 on prose). Any single-run
+number under ~150 t/s code / ~65 t/s prose is inside the band.
+
+**Honest ceiling (campaign close-out):** committed-tokens-per-round is the wall —
+6.2 (code) / 2.7 (prose) per 42–46 ms round. 200 t/s code needs 8.5 committed or
+sub-30 ms rounds; 120 t/s prose needs 5+ committed, which no drafter we tested
+reaches on high-entropy creative text. Details and the remaining levers are in
+[REPORT.md](REPORT.md).
+
+## Measured and rejected
+
+Half the value of a campaign is what didn't work:
+
+| Lever | Verdict | Why |
+|---|---|---|
+| Sparse draft head (32k vocab subset) | ✗ rejected | −10% on code (subset drops good draft tokens), neutral on prose |
+| fp16 draft head (5.0bpw-h16) | ✗ rejected | +0.9% code ≈ noise, worse prose acceptance; head precision isn't the bottleneck |
+| 6.0bpw drafter body | ✗ rejected | +0–3% code, inside noise band; not worth +0.2 GB |
+| Verify-pass CUDA graph | ✗ rejected | capture dies with `AcceleratorError` — paged-cache growth allocates inside the captured region. Round time identical to eager; apparent gains were trajectory noise |
+| Hybrid n-gram + dynamic verify stacked | ✗ rejected | n-gram drafts disagree with confidence truncation → wasted verify width |
+| Dynamic verify on code | = wash | matches static15 once repeated (earlier single-rep 163.8 was trajectory luck) |
+
+Accepted levers: dynamic verification (DSpine c0.25 = best confidence, U-shaped sweep),
+n-gram hybrid as **static + hyb8 on prose** (+5–8%), EXL3 5.0bpw-h8 drafter quant
+(equal acceptance to BF16 at 40% the size).
+
+## Repository layout
+
+```
+engine/    exllamav3 v1.6.6 campaign diff (one patch) + dspine.py / tree_engine.py
+benches/   every harness that produced a reported number, + raw result JSONs
+serve/     serve_prose.py — OpenAI-compatible server (stdlib only, no deps)
+REPORT.md  the deep report: paper vs rig, camp-by-camp ladder, laws, verdicts
 ```
 
-Numbers in REPORT.md are measured, same-day A/Bs; projections are labeled.
+## Quick start
+
+```bash
+# deps: exllamav3 (patched with engine/0001-*.patch), torch + CUDA, a GPU with 24 GB
+python serve/serve_prose.py --port 8900              # default lane: DSpine-EXL3-5.0bpw-h8
+
+curl -s localhost:8900/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages":[{"role":"user","content":"Write a story about a lighthouse."}],
+  "max_tokens": 400
+}'
+```
+
+Server features (all measured, live):
+
+- Lanes: `dspine` (default, window 15, dynamic verify c0.25), `dspine-bf16`, `dflash2`, `dflash2-bf16` — per-lane context pools sized for 24 GB
+- Vision: `image_url` parts (base64 or http); the vision tower loads on first image and auto-unloads
+- Thinking: `reasoning_effort` (xhigh default / medium / low), `enable_thinking`, z.ai-style `thinking: {"type": "disabled"}` — invalid values return the chat template's own 400
+- Streaming SSE, per-request draft stats, clean 400/503 on oversize prompts and OOM
+
+Reproduce the benches: each script under `benches/` is standalone (`python benches/spinecamp1.py`),
+reads its prompts from the pipeline directory, and writes its result JSON next to
+the copies in `benches/results/`.
+
+## Credits
+
+- **[turboderp](https://github.com/turboderp) and the exllamav3 contributors** — the
+  engine everything here runs on, including the in-tree dynamic-verification and
+  n-gram machinery this campaign tuned. The speed baseline (dense 42.4 t/s, the whole
+  verify path) is their work.
+- **Tencent's DSpine team** — the drafter architecture this project is built around:
+  [paper (arXiv 2609.36173)](https://arxiv.org/abs/2609.36173), [GitHub](https://github.com/Tencent/DSpine),
+  [HF drafter](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16). Our contribution
+  is the deployment-side campaign: quantizing the drafter to EXL3, the verification-width
+  and hybrid sweeps, and the negative results.
+- **z-lab** — DFlash2, used as the comparison lane throughout.
+- The target quant is published at
+  [nguyenminhtri99/Qwen3.8-27B-EXL3-4.0bpw-h8](https://huggingface.co/nguyenminhtri99/Qwen3.8-27B-EXL3-4.0bpw-h8).
+
+## License
+
+MIT — see [LICENSE](LICENSE). The engine patch in `engine/` modifies exllamav3
+(also MIT, © Turboderp); drafter architectures referenced are the property of
+their authors. No model weights are included in this repository.
