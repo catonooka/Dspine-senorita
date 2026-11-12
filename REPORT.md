@@ -273,3 +273,47 @@ max_history>16 to unlock TREE_CAP>15.
   fewer capture hazards than the target). Projected: +10% round time.
 - **Acceptance on prose**: no quant knob reached it (camps 1–5); needs a better
   drafter or tree verification (Triton tree-delta kernel, days of work).
+
+# Blocker work log (2026-11-12, post-research)
+
+## Upstream survey — master == v1.6.6 (bd1f519); dev = 27 commits ahead (4db6a855)
+The API "graph commits" (GDN b/a GEMV single-pass d33d1869, batched spec-window
+readback 288d0434, PR #489 replay) all predate v1.6.6 — already in our tree (squashed
+clone hides SHAs; content verified by date). dev adds pipelined prefill, rolling
+checkpoints, QSA/BlockSparse — nothing for verify-graph. **No ready-made verify-graph
+runner exists upstream; the campaign's own surgery is the only path.**
+
+## Blocker 1 — verify CUDA graph: 3 obstacles unpeeled (vgtrace1-3, GPU2)
+1. GDN decode/verify already runs per-layer through the extension's OWN BC graph
+   (BC_GatedDeltaNet(Split), graph.cu: cudaGraphExecKernelNodeSetParams + cudaGraphLaunch).
+   torch.cuda.graph() capture nests over it → `operation not permitted when stream is
+   capturing` at graph.cu:252. Routed around with `EXL3_GDN_FORCE_TORCH=1` (forces the
+   plain-kernel torch path; +1-line condition in gated_delta_net.py).
+2. Next blocker: multilinear `c_ptrs` builds a fresh CPU→GPU pointer table every call
+   (multilinear.py:123, illegal pageable H2D in capture). Routed around with
+   `EXL3_GRAPH_SAFE=1`: per-(m) persistent qkv/z/xh buffers + cached c_ptrs
+   (gated_delta_net.py project_qkvz_sliced).
+3. Next: capture now runs deeper but the stream gets invalidated mid-capture
+   (cudaErrorStreamCaptureInvalidated at capture_end) — at least one more illegal op
+   further in (conv/scan/export machinery), AND the aborted capture leaves engine state
+   dirty enough that the following eager draft phase hits `A and B incompatible shapes`
+   in the drafter's input projection. Status: **capture not yet green; two env-gated
+   engine patches land the groundwork; remaining depth unknown.**
+
+Law: the ~26 ms "fixed" verify cost is NOT all launches — the 48 GDN layers already
+replay through per-layer BC graphs (48 launches). The ungraphed remainder is the
+~650 launches of attention/MLP/norm/gemm across 64 layers; that is what whole-pass
+capture would remove.
+
+## Blocker 2 — block-width reps (bw_reps.json, GPU1, 3 reps each)
+| width | story t/s | code t/s |
+|---|---:|---:|
+| 8 | **60.2** (58.6/67.8/54.1) | 127.1 |
+| 11 | 58.8 | 111.9 |
+| 15 | 54.8 | **143.9** (140.3/140.1/151.2) |
+
+Prose wants width 8 (+10% mean over 15, bands overlap), code wants full 15. Per-lane
+width is a serving decision (prose lane w8, code lane w15); not applied to the default
+lane yet.
+
+## Blocker 3 — closed (SPS non-lever at bs=1, see RESEARCH.md). Blocker 4 — trees deferred until fused verify exists.

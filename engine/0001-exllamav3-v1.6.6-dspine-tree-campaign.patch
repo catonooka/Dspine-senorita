@@ -89,7 +89,7 @@ index 25e1470..2ec18da 100644
  def get_architectures():
      return ARCHITECTURES
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index 9d11f6f..8d49c79 100644
+index 9d11f6f..3d488aa 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
 @@ -2,6 +2,10 @@ from __future__ import annotations
@@ -158,7 +158,7 @@ index 9d11f6f..8d49c79 100644
          if round_start is not None and draft_tokens is not None:
              # MTP drafts one token per head call; DFlash drafters take one head call for the whole block
              drafted = draft_tokens.shape[-1]
-@@ -1770,10 +1788,59 @@ class Generator:
+@@ -1770,10 +1788,61 @@ class Generator:
          self._upload_arena(arena, batch_size, max_pages_batch, use_offsets, params)
          if self.draft_model:
              params.update(self.draft_model.draft_verifier_params)
@@ -207,7 +207,9 @@ index 9d11f6f..8d49c79 100644
 +                        self._vg_graphs.pop(_vg_key, None)
 +                        self._vg_warm[_vg_key] = -1000
 +                        if _osg.environ.get("DSPINE_VERIFY_GRAPH_DEBUG"):
++                            import traceback as _tb
 +                            print(f"VGFAIL {_vg_key} {_type_name(_e)}", flush=True)
++                            _tb.print_exc()
 +
 +        # Tree-port research hook (DSPINE_TREE_CAPTURE): stash the target's greedy argmax
 +        # over the whole verify window plus the drafted chain, for offline tree replay.
@@ -222,7 +224,7 @@ index 9d11f6f..8d49c79 100644
  
          # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
          # references to recurrent state objects past this iteration.
-@@ -2188,6 +2255,9 @@ class Generator:
+@@ -2188,6 +2257,9 @@ class Generator:
  
  
      def reap_failed_job(self, job, error, results: list):
@@ -481,18 +483,57 @@ index c69c67a..ffc0339 100644
  
          if self.headwise_gate:
 diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
-index 1c37241..8f702b8 100644
+index 1c37241..2de747e 100644
 --- a/exllamav3/modules/gated_delta_net.py
 +++ b/exllamav3/modules/gated_delta_net.py
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,15 @@
  from __future__ import annotations
  from typing_extensions import override
 +import os
  import torch
++
++
++def _osg_env_flag(name):
++    """Campaign hook: env switches that reroute the GDN decode path (e.g. for
++    whole-pass CUDA-graph capture, where the internal BC graph launch is illegal)."""
++    return bool(os.environ.get(name))
++
++
  import torch.nn.functional as F
  from ..model.config import Config
-@@ -1305,7 +1306,8 @@ class GatedDeltaNet(Module):
+ from ..util.tensor import get_for_device, to2
+@@ -1145,10 +1154,22 @@ class GatedDeltaNet(Module):
+         if x.shape[-1] < hidden:
+             x = torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))
+         x = x.contiguous().view(1, m, hidden)
+-        xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
+-        qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
+-        z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
+-        c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
++        # Graph-safe path (EXL3_GRAPH_SAFE=1): per-(m) persistent outputs so the
++        # c_ptrs host->device pointer table is built once and stays valid under
++        # whole-pass CUDA-graph capture/replay.
++        _gs = _osg_env_flag("EXL3_GRAPH_SAFE")
++        _bufs = getattr(self, "_graph_safe_bufs", None)
++        if _gs and _bufs is not None and m in _bufs:
++            xh, qkv, z, c_ptrs = _bufs[m]
++        else:
++            xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
++            qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
++            z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
++            c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
++            if _gs:
++                if _bufs is None:
++                    _bufs = self._graph_safe_bufs = {}
++                _bufs[m] = (xh, qkv, z, c_ptrs)
+         ext.exl3_mgemm(
+             x,
+             mq.ptrs_trellis,
+@@ -1303,9 +1324,11 @@ class GatedDeltaNet(Module):
+         # history) shape from the third invocation of that shape on
+         if (
              self.bc_split and save_state and
++            not _osg_env_flag("EXL3_GDN_FORCE_TORCH") and
              recurrent_slots is not None and
              1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN and
 -            not spec_step
@@ -501,7 +542,7 @@ index 1c37241..8f702b8 100644
          ):
              stage_key = id(rsl) if save_history else 0
              if self.bc.needs_configure(bsz, seqlen, save_history, stage_key):
-@@ -1428,39 +1430,130 @@ class GatedDeltaNet(Module):
+@@ -1428,39 +1451,130 @@ class GatedDeltaNet(Module):
              )
  
          # Convolution
