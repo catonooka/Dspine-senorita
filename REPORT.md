@@ -490,3 +490,21 @@ rounds amplify the per-round host refresh overhead (embedding staging refill, hc
 relays, advance_recurrent_states). Production stays K8V8 without graphs (prose 80-81,
 code 119-120 on GPU0). Unlock path = P2: make the fused GDN/BC path capture-safe so
 graphs stop paying the FORCE_TORCH penalty; then re-run this gate.
+
+## P1 correctness leg — upstream lossless test suite (2026-11-13)
+The engine ships its own adversarial test suite (tests/, pytest). Wired the production
+27B quant into the model registry (tests/models.local.yaml, untracked) and ran the
+spec/decode-consistency matrices on GPU1, both with default envs AND under the full
+verify-graph matrix (DSPINE_GRAPH=1 DSPINE_VERIFY_GRAPH=1 EXL3_GDN_FORCE_TORCH=1
+EXL3_GRAPH_SAFE=1 EXL3_BC_ATTN=0):
+- tests/e2e/test_speculative.py::test_drafting_is_lossless[ngram-recurrent] PASSED
+- test_drafting_is_lossless[hybrid-ngram-recurrent] PASSED (long hybrid drafts through
+  recurrent-state replay)
+- tests/e2e/test_decode_consistency.py::test_decode_matches_forward[recurrent-fp16_cache] PASSED
+- [recurrent-q8_cache] PASSED (8-bit cache decode consistency)
+- [recurrent-fp32_state] PASSED
+5/5 under both env sets: greedy spec-decode is LOSSLESS and q8-cache decode consistent
+on this exact quant, with all campaign patches in the tree, graphs on or off.
+This is the independent correctness proof K8V8 nondeterminism denied the two-world
+method. Speed verdict for graphs stays workload-dependent (chat/code win, one-shot
+short prose -5%); adoption decision pending.
