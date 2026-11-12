@@ -28,10 +28,10 @@ verify-pass CUDA graphs. All English prompts, greedy, 2-3 reps, warm server.
 
 | Workload | Peak t/s (bias-tuned prompt) | Typical t/s (hard prompt) |
 |---|---:|---:|
-| Prose | **86.4** | 59-60 |
-| Code | **132.6** | 110 |
-| Structure (strict JSON) | **204.4** | 106 |
-| Math (step-by-step) | **206.7** | 125 |
+| Prose | **90.0** | 59-60 |
+| Code | **138.0** | 110 |
+| Structure (strict JSON) | **213.6** | 106 |
+| Math (step-by-step) | **217.0** | 125 |
 
 Continuous multi-turn chat gains 5-13% over the same build without graphs, code
 +11%. K8V8 replaced the fp16 cache at equal VRAM: context grew 90k -> 164k tokens
@@ -89,7 +89,8 @@ RESEARCH.md  sourced solutions to the four measured blockers (graphs, draft tail
 #   systemd-run --user --unit=senorita --collect -p MemoryMax=infinity \
 #     -E CUDA_VISIBLE_DEVICES=0 \
 #     -E DSPINE_GRAPH=1 -E DSPINE_VERIFY_GRAPH=1 \
-#     -E EXL3_GDN_FORCE_TORCH=1 -E EXL3_GRAPH_SAFE=1 -E EXL3_BC_ATTN=0 \
+#     -E EXL3_GRAPHS=0 -E EXL3_GRAPH_SAFE=1 -E EXL3_BC_ATTN=0 \
+#     -E DSPINE_DRAFT_GRAPH=1 \
 #     bash -c 'python serve/serve_prose.py --port 8900 --window 8 \
 #       --kv8 --pool 163840 > server.log 2>&1'
 # drop the five -E env vars and the --kv8 --pool flags for the no-graphs fp16 build

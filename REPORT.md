@@ -9,19 +9,24 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 
 ---
 
-## 0. Current production snapshot (updated 2026-11-13, P2)
+## 0. Current production snapshot (updated 2026-11-13, P3)
 
 GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on,
-and since P2 the fused BC GDN kernels run inside the verify graph
-(EXL3_GRAPHS=0, EXL3_GDN_FORCE_TORCH unset). English numbers (greedy, warm server,
-2-3 reps, same GPU):
+fused BC GDN kernels inside the verify graph (EXL3_GRAPHS=0, EXL3_GDN_FORCE_TORCH
+unset), and since P3 the whole draft block forward runs as one CUDA graph
+(DSPINE_DRAFT_GRAPH=1). English numbers (greedy, warm server, 2-3 reps, same GPU):
 
 | Workload | Peak t/s | Typical t/s |
 |---|---:|---:|
-| Prose | 86.4 | 59-60 |
-| Code | 132.6 | 110 |
-| Structure (strict JSON) | 204.4 | 106 |
-| Math (step-by-step) | 206.7 | 125 |
+| Prose | 90.0 | 59-60 |
+| Code | 138.0 | 110 |
+| Structure (strict JSON) | 213.6 | 106 |
+| Math (step-by-step) | 217.0 | 125 |
+
+P3 (draft graph) vs P2, same 3090 back to back: peaks +4-5% on all four classes,
+EN one-shot prose 63.5 t/s (+2.8%), multi-turn chat 63.7 t/s avg (+5.5%), VN long
+55.6 t/s (noise-level vs 56.7). Draft phase drops 9.5 to 7.0 ms per round. Upstream
+lossless suite 5/5 with draft graphs on.
 
 P2 (fused GDN in graph) vs the P1 stack, measured back to back on one 3090:
 Vietnamese long prose +15.7% (49.0 -> 56.7 t/s; the old -15.2% regression is fully
