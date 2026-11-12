@@ -56,6 +56,7 @@ engine/    exllamav3 v1.6.6 campaign diff (one patch) + dspine.py / tree_engine.
 benches/   every harness that produced a reported number, + raw result JSONs
 serve/     serve_prose.py — OpenAI-compatible server (stdlib only, no deps)
 REPORT.md  the deep report: paper vs rig, camp-by-camp ladder, laws, verdicts
+RESEARCH.md  sourced solutions to the four measured blockers (graphs, draft tail, SPS, trees)
 ```
 
 ## Quick start
