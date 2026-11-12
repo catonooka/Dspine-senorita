@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 os.environ.setdefault("DSPINE_GRAPH", "1")
 sys.path.insert(0, os.path.expanduser("~/exl3_pipeline/exllamav3"))
 import torch
-from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
+from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ComboSampler
 
 VISION_ENABLED = True
 try:
@@ -210,6 +210,38 @@ class ToolStreamFilter:
         self.buf = ""
 
 
+def _tool_call_xml(fn):
+    """One tool_call dict -> Qwen3.8 XML block (mirrors chat_template.jinja)."""
+    name = fn.get("name", "")
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {"raw": args}
+    if not isinstance(args, dict):
+        args = {"raw": json.dumps(args, ensure_ascii=False)}
+    inner = ""
+    for k, v in args.items():
+        val = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        inner += f"<parameter={k}>\n{val}\n</parameter>\n"
+    return f"<tool_call>\n<function={name}>\n{inner}</function>\n</tool_call>"
+
+
+def _assistant_body(m):
+    """Assistant message -> body incl. tool_call XML (chat_template.jinja layout:
+    first call after non-empty content is preceded by a blank line, after empty
+    content it starts immediately, further calls by a single newline)."""
+    body = m.get("content") or ""
+    body = body.strip() if isinstance(body, str) else str(body)
+    calls = m.get("tool_calls") or []
+    for i, tc in enumerate(calls):
+        fn = tc.get("function") or tc
+        sep = "\n\n" if (i == 0 and body) else ("\n" if i else "")
+        body += sep + _tool_call_xml(fn)
+    return body
+
+
 def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effort="xhigh",
                 tools=None):
     """Qwen chat template; image aliases spliced before text; effort + thinking per template."""
@@ -224,18 +256,35 @@ def chat_prompt(messages, embeddings=None, enable_thinking=True, reasoning_effor
         parts.append(f"<|im_start|>system\n{sys}<|im_end|>\n")
     elif eff:
         parts.append(f"<|im_start|>system\n{eff}<|im_end|>\n")
+    convo = [m for m in messages if m.get("role") != "system"]
     first_user = True
-    for m in messages:
-        if m.get("role") == "system":
+    for idx, m in enumerate(convo):
+        role = m.get("role")
+        if role == "tool":
+            # consecutive tool results merge into ONE user turn of <tool_response> blocks
+            prev_tool = idx > 0 and convo[idx - 1].get("role") == "tool"
+            next_tool = idx + 1 < len(convo) and convo[idx + 1].get("role") == "tool"
+            if not prev_tool:
+                parts.append("<|im_start|>user")
+            body = m.get("content") or ""
+            body = body.strip() if isinstance(body, str) else str(body)
+            parts.append(f"\n<tool_response>\n{body}\n</tool_response>")
+            if not next_tool:
+                parts.append("<|im_end|>\n")
             continue
-        role = "user" if m.get("role") != "assistant" else "assistant"
-        body = m["content"]
+        role = "user" if role != "assistant" else "assistant"
+        body = _assistant_body(m) if role == "assistant" else (m.get("content") or "")
         if role == "user" and first_user and aliases:
             body = "\n".join(aliases) + "\n" + body
             first_user = False
         parts.append(f"<|im_start|>{role}\n{body}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
-    if not enable_thinking:
+    # chat_template.jinja add_generation_prompt: thinking on -> prefill the open
+    # <think> block (the model continues it; it cannot decline to think); off ->
+    # the closed empty block makes it answer directly.
+    if enable_thinking:
+        parts.append("<think>\n")
+    else:
         parts.append("<think>\n\n</think>\n\n")  # exact template off-switch
     return "".join(parts)
 
@@ -315,20 +364,24 @@ class Server:
 
     # ---------- generation ----------
 
-    def _gen_pass(self, input_ids, max_new_tokens, temperature, embeddings, emit=None):
-        """Run one Job to completion; returns (text, decode_s, n_tokens, hit_cap).
+    def _gen_pass(self, input_ids, max_new_tokens, sampler, embeddings, emit=None,
+                  min_new_tokens=0):
+        """Run one Job to completion; returns (text, decode_s, n_tokens, hit_cap, eos_reason).
         t0-late fallback keeps t/s defined even for zero/one-token passes."""
         job = Job(input_ids=input_ids, max_new_tokens=max_new_tokens,
-                  decode_special_tokens=True, temperature=temperature,
+                  min_new_tokens=min_new_tokens,
+                  decode_special_tokens=True, sampler=sampler,
                   stop_conditions=self.eos, embeddings=embeddings)
         with self.lock:
             self.gen.enqueue(job)
-            out, t0, t_start = "", None, time.time()
+            out, t0, t_start, eos_reason = "", None, time.time(), None
             while self.gen.num_remaining_jobs():
                 results = self.gen.iterate()
                 if t0 is None and out:
                     t0 = time.time()
                 for r in results:
+                    if r.get("eos_reason"):
+                        eos_reason = r["eos_reason"]
                     d = r.get("text", "")
                     if d:
                         if emit:
@@ -336,13 +389,19 @@ class Server:
                         out += d
             dt = max(1e-6, time.time() - (t0 if t0 is not None else t_start))
         n = len(self.tokenizer.encode(out, encode_special_tokens=True).flatten())
-        return out, dt, n, n >= max_new_tokens
+        return out, dt, n, n >= max_new_tokens, eos_reason
 
     def generate(self, messages, max_tokens, temperature=0.0, emit=None,
                  enable_thinking=True, reasoning_effort="xhigh", tools=None,
-                 think_rescue=True):
+                 think_rescue=True, top_p=1.0, top_k=0, min_p=0.0, min_tokens=0):
         """Full generation (streaming via emit(text_delta) if given).
         Returns (text, tps, total_completion_tokens, hit_cap_of_last_pass).
+
+        Sampling: temperature/top_p/top_k/min_p reach the engine via ComboSampler
+        (a bare temperature= kwarg on Job is silently swallowed by **kwargs).
+
+        min_tokens: engine-native min_new_tokens — stop tokens are suppressed
+        until that many tokens have been sampled.
 
         Think rescue: if thinking was on and generation ended inside an open
         <think> block (token cap hit mid-think, or premature EOS), the client
@@ -356,8 +415,25 @@ class Server:
                              tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings)
-        out, dt, n, capped = self._gen_pass(input_ids, max_tokens, temperature,
-                                            embeddings, emit)
+        sampler = ComboSampler(temperature=temperature, top_p=top_p, top_k=top_k,
+                               min_p=min_p)
+        min_new = max(0, min(int(min_tokens), max_tokens))
+        out = "<think>\n" if enable_thinking else ""  # opener is prefilled in the
+        if out and emit:                              # prompt; re-emit it so the
+            emit(out)                                 # client sees complete tags
+        gen1, dt, n, capped, eos_reason = self._gen_pass(
+            input_ids, max_tokens, sampler, embeddings, emit, min_new_tokens=min_new)
+        out += gen1
+        if enable_thinking and n == 0:
+            # instant-EOS rescue (Bug 5): the model stopped on the very first
+            # token despite the prefilled think opener. Suppress stop tokens for
+            # a bounded retry so at least a well-formed think block comes back.
+            print(f"[serve] empty completion rescue: 0 tokens, eos_reason="
+                  f"{eos_reason}, {len(messages)} msgs, thinking on", flush=True)
+            out2, dt2, n2, capped, _ = self._gen_pass(
+                input_ids, max_tokens, sampler, embeddings, emit,
+                min_new_tokens=max(32, min_new))
+            out, n, dt = out + out2, n + n2, dt + dt2
         if think_rescue and enable_thinking and unterminated_think(out):
             bridge = "</think>\n\n"
             cont_prompt = trim_partial_think_close(out) + bridge
@@ -366,8 +442,8 @@ class Server:
                                                embeddings=embeddings)
             if emit:
                 emit(bridge)
-            out2, dt2, n2, capped = self._gen_pass(
-                input_ids2, THINK_RESCUE_TOKENS, temperature, embeddings, emit)
+            out2, dt2, n2, capped, _ = self._gen_pass(
+                input_ids2, THINK_RESCUE_TOKENS, sampler, embeddings, emit)
             out = cont_prompt + out2  # trimmed think + injected close + answer
             n = n + n2                # completion tokens summed across passes
             dt += dt2
@@ -429,6 +505,12 @@ class Handler(BaseHTTPRequestHandler):
         max_tokens = max(1, min(max_tokens, 32768))
         temperature = float(req.get("temperature") or 0.0)
         temperature = 0.0 if temperature < 1e-4 else temperature
+        top_p = min(1.0, max(0.0, float(req.get("top_p") or 1.0)))
+        top_k = max(0, int(req.get("top_k") or 0))
+        min_p = min(1.0, max(0.0, float(req.get("min_p") or 0.0)))
+        # min_tokens: OpenAI-style minimum completion length; engine suppresses
+        # stop tokens until it is reached (min_completion_tokens also accepted)
+        min_tokens = int(req.get("min_tokens") or req.get("min_completion_tokens") or 0)
         stream = bool(req.get("stream"))
         tools = req.get("tools") or None
         # think-rescue continuation (close unterminated <think>, answer with a
@@ -494,7 +576,8 @@ class Handler(BaseHTTPRequestHandler):
                     messages, max_tokens, temperature,
                     emit=lambda d: flt.feed(d),
                     enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
-                    tools=tools, think_rescue=think_rescue)
+                    tools=tools, think_rescue=think_rescue, top_p=top_p, top_k=top_k,
+                    min_p=min_p, min_tokens=min_tokens)
                 flt.flush()
                 chunk("", finish=finish_reason(capped, flt.has_tools))
                 sse({"stats": {"tokens": n, "tps": round(tps, 1),
@@ -511,7 +594,10 @@ class Handler(BaseHTTPRequestHandler):
                                                     enable_thinking=enable_thinking,
                                                     reasoning_effort=reasoning_effort,
                                                     tools=tools,
-                                                    think_rescue=think_rescue)
+                                                    think_rescue=think_rescue,
+                                                    top_p=top_p, top_k=top_k,
+                                                    min_p=min_p,
+                                                    min_tokens=min_tokens)
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
