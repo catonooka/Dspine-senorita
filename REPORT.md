@@ -317,3 +317,31 @@ width is a serving decision (prose lane w8, code lane w15); not applied to the d
 lane yet.
 
 ## Blocker 3 — closed (SPS non-lever at bs=1, see RESEARCH.md). Blocker 4 — trees deferred until fused verify exists.
+
+## Blocker 1 — capture surgery log (2026-11-12 evening, GPU2)
+- Architecture rewrite shipped: capture-FIRST (record from true pre-state, execute once via
+  replay-once), export_states pool-stash for replay rounds, batch_ids copy_ into captured
+  tensor, per-(slot,parity) graph key. Gate bug fixed (string-truthy "0").
+- RESULT: capture SUCCEEDS (VGCAP), capture-round replay is BIT-EXACT vs eager
+  (max_abs=0.0000, argmax 1.000). Post-capture corruption + fc shape death: GONE (COMPLETED_CLEAN).
+- REMAINING: replays on LATER rounds diverge (max_abs 30-43, argmax 0.0). Parity key
+  (2 graphs) did not fix. Root class: per-round host-side values baked into kernel launch
+  args at record time (GDN position-derived decay/scan offsets, slots via _get_slot_tensor
+  device-cache, possible KV write offsets). Next step = static-state capture (vLLM-style):
+  dedicated graph slot rows, position-independent scan, tensor-driven offsets.
+- Attention qkv c_ptrs capture-illegal copy fixed same as GDN (persistent bufs, EXL3_GRAPH_SAFE).
+- Env matrix to reproduce: DSPINE_VERIFY_GRAPH=1 EXL3_GDN_FORCE_TORCH=1 EXL3_GRAPH_SAFE=1
+  EXL3_BC_ATTN=0 (+DEBUG/TELLERY/SELFCHECK probes).
+
+## Blocker 2 — clean draft/verify kernel census (GPU1, draft_trace, 30 story rounds w15)
+Per round (steady state, from chrome trace key_averages):
+- exl3_gemm 16x16x512   x128/round @86.6us = 11.1ms  (target body, 62L)
+- exl3_gemm 16x32x256   x 64/round @101.6us = 6.5ms
+- exl3_mgemm 16x16x512  x 48/round @88.3us = 4.2ms   (fused qkv groups)
+- GDN scan_128          x 48/round @68.3us = 3.3ms   (48 GDN layers)
+- exl3_gemm 16x32x128   x 64/round @48.7us = 3.1ms
+- conv1d_update         x 48/round @14.2us = 0.7ms; fused_op x48 @5us = 0.24ms
+- top-k/gather/scatter tails ~0.3ms total
+Top-7 sum ~29ms GPU/round vs measured round 42-50ms => ~13-20ms host/gap overhead per round
+(launch storms + sync points), consistent with ~703-launch anatomy. Full timeline JSON kept
+(draft_trace.json 115MB) for phase segmentation (draft vs verify windows) next.
