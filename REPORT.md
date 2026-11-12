@@ -416,3 +416,15 @@ Findings ladder:
 NEXT: audit the verify forward path for scalar kernel args (grep .item()/int(
 in gated_delta_net chain path, attn/cache get_kv, conv1d update) and convert
 them to tensor-driven args (the planned static-state capture surgery).
+
+## Live server bench (2026-11-13, GPU0, commit after Bug-8 fixes)
+Launch: `--window 8` (bw_reps prose-best), lane=dspine dynamic c0.25, thinking ON,
+3 reps each, 500-1000-token generations, stats from the server itself:
+- prose (creative story): 75.2 / 77.5 / 78.3 / 78.4 t/s (1012 tokens)
+- code (LRU cache impl): 117.4 / 117.7 / 118.1 t/s (702 tokens)
+- structure (strict JSON): 165.3 / 165.3 / 166.0 / 169.6 t/s (157 tokens)
+- native tool_calls (booking): 119.1 / 120.7 / 122.6 t/s (129 tokens)
+Prose is ~38% over the campaign-close mean (55-57). Removed the per-request
+`draft_window` field: the generator sizes buffers from the window at init, so
+switching to a larger window at runtime crashes (tensor size mismatch 8 vs 15);
+window is launch-time only (`--window`).

@@ -583,10 +583,6 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(th, dict) and th.get("type") == "disabled":
             enable_thinking = False
         model_id = "qwen3.8-27b-exl3-4bpw-prose"
-        # per-request drafter window (bw_reps: prose w8 60.2 t/s, code w15 143.9);
-        # launch default set by --window. Validated 1..31.
-        dw = req.get("draft_window")
-        draft_window = max(1, min(31, int(dw))) if dw else None
         t0 = time.time()
 
         # Bug 8: decode/validate ALL images BEFORE any bytes go out — a corrupt
@@ -599,10 +595,6 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"error": f"image processing failed: {e}"})
             return
-
-        # self-healing override: reset to default, then apply per-request width
-        SRV.gen.num_draft_tokens = draft_window or getattr(SRV, "default_window",
-                                                           SRV.gen.num_draft_tokens)
 
         if stream:
             self.send_response(200)

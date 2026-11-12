@@ -17,6 +17,12 @@ GPU locked at 350 W / 1770 MHz. Run-to-run spread is stated wherever it matters.
 | Creative prose (thinking on) | static15 + n-gram hybrid 8 | 55–57 | 64.7 |
 | Dense floor (no drafting) | — | 42.4 | — |
 
+**Live server, 2026-11-13** (thinking on, `--window 8`, all engine + server fixes,
+3 reps, 500–1000-token generations): prose **75–78**, code **117–118**,
+strict-JSON structure **165–170**, native tool calls **119–123**. The window-8
+launch policy (bw_reps per-class measurement) plus the template/sampler fixes
+lifted prose ~38% over the campaign-close numbers above.
+
 Reference, same rig and harness (not the project default): DFlash2-EXL3-5.0bpw
 drafter reaches ~75 t/s on prose. DSpine keeps the code lane and is the project's
 default lane; both drafters ship as switchable lanes in the server.
@@ -63,7 +69,11 @@ RESEARCH.md  sourced solutions to the four measured blockers (graphs, draft tail
 
 ```bash
 # deps: exllamav3 (patched with engine/0001-*.patch), torch + CUDA, a GPU with 24 GB
-python serve/serve_prose.py --port 8900              # default lane: DSpine-EXL3-5.0bpw-h8
+# production launch used on the bench rig:
+#   systemd-run --user --unit=senorita --collect -p MemoryMax=infinity \
+#     -E CUDA_VISIBLE_DEVICES=0 bash -c '\
+#       python serve/serve_prose.py --port 8900 --window 8 > server.log 2>&1'
+python serve/serve_prose.py --port 8900 --window 8   # default lane: DSpine-EXL3-5.0bpw-h8
 
 curl -s localhost:8900/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages":[{"role":"user","content":"Write a story about a lighthouse."}],
@@ -77,6 +87,11 @@ Server features (all measured, live):
 - Vision: `image_url` parts (base64 or http); the vision tower loads on first image and auto-unloads
 - Thinking: `reasoning_effort` (xhigh default / medium / low), `enable_thinking`, z.ai-style `thinking: {"type": "disabled"}` — invalid values return the chat template's own 400
 - Streaming SSE, per-request draft stats, clean 400/503 on oversize prompts and OOM
+- `--window N` sets the drafter window at launch (bw_reps: prose w8, code w15; runtime
+  per-request switching is NOT supported — the generator sizes buffers at init)
+- Corrupt/truncated images return `400 {"error": "invalid image data at messages[i]"}`
+  instead of killing the connection; every lane-internal error surfaces as JSON
+  (Bug 8 — this was the root cause of the ECONNRESET retry storms)
 
 Reproduce the benches: each script under `benches/` is standalone (`python benches/spinecamp1.py`),
 reads its prompts from the pipeline directory, and writes its result JSON next to
