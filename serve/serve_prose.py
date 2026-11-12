@@ -103,6 +103,21 @@ def _tools_system_block(tools, effort_instr, sys_content):
 
 
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+THINK_RESCUE_TOKENS = 512  # bounded extra budget for the think-rescue continuation
+
+
+def unterminated_think(text):
+    """True if text ends inside an open <think> block (last open has no close)."""
+    return text.rfind(THINK_OPEN) > text.rfind(THINK_CLOSE)
+
+
+def trim_partial_think_close(text):
+    """Drop a trailing partial '</think>' so the injected close stays well-formed."""
+    for k in range(len(THINK_CLOSE) - 1, 0, -1):
+        if text.endswith(THINK_CLOSE[:k]):
+            return text[:-k]
+    return text
 
 
 def parse_tool_block(block):
@@ -237,8 +252,8 @@ class Server:
         self.vision_lock = threading.Lock()
         print(f"[serve] lane={lane} window={LANES[lane][1]} dynamic={dynamic} conf={conf} "
               f"loaded in {time.time()-t0:.0f}s", flush=True)
-        # warmup
-        self.generate([{"role": "user", "content": "Say OK."}], 8)
+        # warmup (think_rescue off: keep boot fast, answer completeness irrelevant)
+        self.generate([{"role": "user", "content": "Say OK."}], 8, think_rescue=False)
         print("[serve] warmup done", flush=True)
 
     # ---------- vision ----------
@@ -300,43 +315,12 @@ class Server:
 
     # ---------- generation ----------
 
-    def generate(self, messages, max_tokens, temperature=0.0,
-                 enable_thinking=True, reasoning_effort="xhigh", tools=None):
-        """Full generation, returns (text, tps, n_tokens)."""
-        messages, img_urls = self.extract_images(messages)
-        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
-                             tools)
-        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
-                                          embeddings=embeddings or None)
-        job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
+    def _gen_pass(self, input_ids, max_new_tokens, temperature, embeddings, emit=None):
+        """Run one Job to completion; returns (text, decode_s, n_tokens, hit_cap).
+        t0-late fallback keeps t/s defined even for zero/one-token passes."""
+        job = Job(input_ids=input_ids, max_new_tokens=max_new_tokens,
                   decode_special_tokens=True, temperature=temperature,
-                  stop_conditions=self.eos, embeddings=embeddings or None)
-        with self.lock:
-            self.gen.enqueue(job)
-            out, t0, t_start = "", None, time.time()
-            while self.gen.num_remaining_jobs():
-                results = self.gen.iterate()
-                if t0 is None and out:
-                    t0 = time.time()
-                for r in results:
-                    out += r.get("text", "")
-            dt = max(1e-6, time.time() - (t0 if t0 is not None else t_start))
-        n = len(self.tokenizer.encode(out, encode_special_tokens=True).flatten())
-        return out, n / dt, n
-
-    def generate_stream(self, messages, max_tokens, temperature=0.0, emit=None,
-                        enable_thinking=True, reasoning_effort="xhigh", tools=None):
-        """Streaming generation; emit(text_delta) called per chunk. Returns stats."""
-        messages, img_urls = self.extract_images(messages)
-        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls]
-        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
-                             tools)
-        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
-                                          embeddings=embeddings or None)
-        job = Job(input_ids=input_ids, max_new_tokens=max_tokens,
-                  decode_special_tokens=True, temperature=temperature,
-                  stop_conditions=self.eos, embeddings=embeddings or None)
+                  stop_conditions=self.eos, embeddings=embeddings)
         with self.lock:
             self.gen.enqueue(job)
             out, t0, t_start = "", None, time.time()
@@ -346,12 +330,49 @@ class Server:
                     t0 = time.time()
                 for r in results:
                     d = r.get("text", "")
-                    if d and emit:
-                        emit(d)
-                    out += d
+                    if d:
+                        if emit:
+                            emit(d)
+                        out += d
             dt = max(1e-6, time.time() - (t0 if t0 is not None else t_start))
         n = len(self.tokenizer.encode(out, encode_special_tokens=True).flatten())
-        return out, n / dt, n
+        return out, dt, n, n >= max_new_tokens
+
+    def generate(self, messages, max_tokens, temperature=0.0, emit=None,
+                 enable_thinking=True, reasoning_effort="xhigh", tools=None,
+                 think_rescue=True):
+        """Full generation (streaming via emit(text_delta) if given).
+        Returns (text, tps, total_completion_tokens, hit_cap_of_last_pass).
+
+        Think rescue: if thinking was on and generation ended inside an open
+        <think> block (token cap hit mid-think, or premature EOS), the client
+        strips think text and would see an EMPTY answer. Close the block and
+        run a bounded continuation pass that produces the actual answer;
+        deltas keep streaming and completion_tokens are summed across passes.
+        Opt out per request with {"think_rescue": false}."""
+        messages, img_urls = self.extract_images(messages)
+        embeddings = [self.embed_image(self.load_image(u)) for u in img_urls] or None
+        prompt = chat_prompt(messages, embeddings, enable_thinking, reasoning_effort,
+                             tools)
+        input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
+                                          embeddings=embeddings)
+        out, dt, n, capped = self._gen_pass(input_ids, max_tokens, temperature,
+                                            embeddings, emit)
+        if think_rescue and enable_thinking and unterminated_think(out):
+            bridge = "</think>\n\n"
+            cont_prompt = trim_partial_think_close(out) + bridge
+            input_ids2 = self.tokenizer.encode(prompt + cont_prompt,
+                                               encode_special_tokens=True,
+                                               embeddings=embeddings)
+            if emit:
+                emit(bridge)
+            out2, dt2, n2, capped = self._gen_pass(
+                input_ids2, THINK_RESCUE_TOKENS, temperature, embeddings, emit)
+            out = cont_prompt + out2  # trimmed think + injected close + answer
+            n = n + n2                # completion tokens summed across passes
+            dt += dt2
+        tps = n / dt
+        return out, tps, n, capped
 
 
 SRV = None
@@ -410,6 +431,9 @@ class Handler(BaseHTTPRequestHandler):
         temperature = 0.0 if temperature < 1e-4 else temperature
         stream = bool(req.get("stream"))
         tools = req.get("tools") or None
+        # think-rescue continuation (close unterminated <think>, answer with a
+        # bounded +512-token pass); default on, opt out with {"think_rescue": false}
+        think_rescue = bool(req.get("think_rescue", True))
         # thinking controls: OpenAI-style reasoning_effort/enable_thinking +
         # z.ai-style thinking.type parity; "none" = alias for thinking off
         reasoning_effort = req.get("reasoning_effort") or "xhigh"
@@ -454,10 +478,10 @@ class Handler(BaseHTTPRequestHandler):
                                                    "arguments": json.dumps(call["arguments"])}}]},
                                   "finish_reason": None}]})
 
-            def finish_reason(n, has_tools):
+            def finish_reason(capped, has_tools):
                 if has_tools:
                     return "tool_calls"
-                return "length" if n >= max_tokens else "stop"
+                return "length" if capped else "stop"
 
             try:
                 chunk("")
@@ -466,13 +490,13 @@ class Handler(BaseHTTPRequestHandler):
                     emit_content=lambda d: chunk(d),
                     emit_tool=lambda c: (chunk_tool(tool_idx[0], c),
                                          tool_idx.__setitem__(0, tool_idx[0] + 1)))
-                text, tps, n = SRV.generate_stream(
+                text, tps, n, capped = SRV.generate(
                     messages, max_tokens, temperature,
                     emit=lambda d: flt.feed(d),
                     enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
-                    tools=tools)
+                    tools=tools, think_rescue=think_rescue)
                 flt.flush()
-                chunk("", finish=finish_reason(n, flt.has_tools))
+                chunk("", finish=finish_reason(capped, flt.has_tools))
                 sse({"stats": {"tokens": n, "tps": round(tps, 1),
                                "wall_s": round(time.time() - t0, 2)}})
                 self.wfile.write(b"0\r\n\r\n")
@@ -483,10 +507,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
         else:
             try:
-                text, tps, n = SRV.generate(messages, max_tokens, temperature,
-                                            enable_thinking=enable_thinking,
-                                            reasoning_effort=reasoning_effort,
-                                            tools=tools)
+                text, tps, n, capped = SRV.generate(messages, max_tokens, temperature,
+                                                    enable_thinking=enable_thinking,
+                                                    reasoning_effort=reasoning_effort,
+                                                    tools=tools,
+                                                    think_rescue=think_rescue)
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
@@ -501,7 +526,7 @@ class Handler(BaseHTTPRequestHandler):
                                             "arguments": json.dumps(c["arguments"])}}
                               for c in calls]
             else:
-                finish = "length" if n >= max_tokens else "stop"
+                finish = "length" if capped else "stop"
                 tool_calls = None
             self._json(200, {
                 "id": "cmpl-prose", "object": "chat.completion",
