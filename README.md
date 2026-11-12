@@ -28,10 +28,10 @@ verify-pass CUDA graphs. All English prompts, greedy, 2-3 reps, warm server.
 
 | Workload | Peak t/s (bias-tuned prompt) | Typical t/s (hard prompt) |
 |---|---:|---:|
-| Prose | **82.1** | 59-60 |
-| Code | **124.2** | 110 |
-| Structure (strict JSON) | **193.6** | 106 |
-| Math (step-by-step) | **196.8** | 125 |
+| Prose | **86.4** | 59-60 |
+| Code | **132.6** | 110 |
+| Structure (strict JSON) | **204.4** | 106 |
+| Math (step-by-step) | **206.7** | 125 |
 
 Continuous multi-turn chat gains 5-13% over the same build without graphs, code
 +11%. K8V8 replaced the fp16 cache at equal VRAM: context grew 90k -> 164k tokens

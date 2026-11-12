@@ -9,23 +9,50 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 
 ---
 
-## 0. Current production snapshot (updated 2026-11-13)
+## 0. Current production snapshot (updated 2026-11-13, P2)
 
-GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on.
-English numbers (greedy, warm server, 2-3 reps):
+GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on,
+and since P2 the fused BC GDN kernels run inside the verify graph
+(EXL3_GRAPHS=0, EXL3_GDN_FORCE_TORCH unset). English numbers (greedy, warm server,
+2-3 reps, same GPU):
 
 | Workload | Peak t/s | Typical t/s |
 |---|---:|---:|
-| Prose | 82.1 | 59-60 |
-| Code | 124.2 | 110 |
-| Structure (strict JSON) | 193.6 | 106 |
-| Math (step-by-step) | 196.8 | 125 |
+| Prose | 86.4 | 59-60 |
+| Code | 132.6 | 110 |
+| Structure (strict JSON) | 204.4 | 106 |
+| Math (step-by-step) | 206.7 | 125 |
+
+P2 (fused GDN in graph) vs the P1 stack, measured back to back on one 3090:
+Vietnamese long prose +15.7% (49.0 -> 56.7 t/s; the old -15.2% regression is fully
+cured), English one-shot prose +6.6% (58.0 -> 61.8), peaks +0.5 to +1.4% on all
+four classes, multi-turn chat unchanged. Correctness: upstream lossless suite 5/5
+under the new env, clean generation, coherent text.
+
+Earlier P1 stack numbers (torch GDN inside the graph): peaks 82.1 / 124.2 / 193.6 /
+196.8, EN one-shot -4.8% and VN -15.2% vs no-graphs. Both regressions are gone.
 
 Highlights: context 90k -> 164k at equal VRAM and every class faster (+11-14%),
 because K8V8 halves the KV bytes each verify pass reads. Verify graphs add 5-13%
 on continuous chat and +11% on code. Correctness: upstream lossless suite 5/5 with
 graphs on and off, including the 8-bit-cache decode consistency case. Full story in
-the sections below (P0, P1, peak numbers).
+the sections below (P0, P1, P2, peak numbers).
+
+### P2 - fused GDN kernels inside the verify graph (2026-11-13)
+
+Root finding: EXL3_GRAPHS=0 makes every BC site run its plain eager kernel
+sequence, which is legal to record into the whole-pass verify graph. The fused GDN
+path is then selected by leaving EXL3_GDN_FORCE_TORCH unset. Note the env flag is
+bool(getenv): setting it to ANY value (even 0) forces the slow torch path.
+
+Env matrix: DSPINE_GRAPH=1 DSPINE_VERIFY_GRAPH=1 EXL3_GRAPHS=0 EXL3_GRAPH_SAFE=1
+EXL3_BC_ATTN=0, EXL3_GDN_FORCE_TORCH unset, --window 8 --kv8 --pool 163840.
+
+Known quirk: with EXL3_GRAPHS=0 the MLP and linear BC layers also run eager and
+become run-to-run nondeterministic across processes (fp16 too, with or without
+their internal graphs). In-process everything stays consistent, the lossless suite
+passes, and single-process serving is unaffected. Cross-process bit-exact
+comparison is invalid as a validation method for this stack.
 
 ## 1. TL;DR
 
