@@ -110,7 +110,7 @@ the copies in `benches/results/`.
   and hybrid sweeps, and the negative results.
 - **z-lab** — DFlash2, used as the comparison lane throughout.
 - The target quant is published at
-  [nguyenminhtri99/Qwen3.8-27B-EXL3-4.0bpw-h8](https://huggingface.co/nguyenminhtri99/Qwen3.8-27B-EXL3-4.0bpw-h8).
+  [catonooka/Qwen3.8-27B-EXL3-4.0bpw-h8](https://huggingface.co/catonooka/Qwen3.8-27B-EXL3-4.0bpw-h8).
 
 ## License
 
