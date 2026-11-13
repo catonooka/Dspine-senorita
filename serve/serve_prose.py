@@ -487,9 +487,16 @@ class Server:
         reserve = (THINK_RESCUE_TOKENS + 128) if (think_rescue and enable_thinking) else 128
         cap = budget - n_tok - reserve
         if cap < 1:
-            raise AssertionError(
-                f"prompt {n_tok} tokens exceeds usable context {budget} "
-                f"(pool {self.pool_tokens}, edge margin {EDGE_MARGIN})")
+            # OpenAI-style wording: agent CLIs (oh-omp/omp, opencode, ...)
+            # detect context overflow by regex on this message and then
+            # auto-compact + retry. Custom text = they treat it as a fatal
+            # error and the session dies.
+            raise ContextTooLongError(
+                f"This model's maximum context length is {budget} tokens. "
+                f"However, your messages resulted in {n_tok} tokens "
+                f"(pool {self.pool_tokens}, edge margin {EDGE_MARGIN}, "
+                f"generation reserve {reserve}). "
+                f"Please reduce the length of the messages.")
         if max_tokens > cap:
             print(f"[serve] edge clamp: max_tokens {max_tokens} -> {cap} "
                   f"(prompt {n_tok}, pool {self.pool_tokens})", flush=True)
@@ -550,6 +557,15 @@ class ImageDataError(Exception):
         self.index = index
 
 
+class ContextTooLongError(Exception):
+    """Prompt + generation reserve cannot fit the context pool (edge guard).
+
+    Message text is deliberately OpenAI-shaped ("maximum context length is N
+    tokens ... Please reduce the length of the messages") because agent CLIs
+    (oh-omp OVERFLOW_PATTERNS, opencode, ...) regex-match the message to
+    trigger auto-compaction and retry."""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -570,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": [{
                 "id": "qwen3.8-27b-exl3-4bpw-prose", "object": "model",
                 "owned_by": "catonooka",
-                "context_length": SRV.gen.cache.max_num_tokens,
+                "context_length": SRV.pool_tokens - 4096,  # usable budget = pool - edge margin; raw pool would make clients overshoot into the guard
                 "max_completion_tokens": 32768,
                 "capabilities": {"vision": VISION_ENABLED, "tools": True,
                                  "thinking": ["off", "low", "medium", "xhigh"],
@@ -695,6 +711,13 @@ class Handler(BaseHTTPRequestHandler):
             except torch.cuda.OutOfMemoryError:
                 sse({"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 self.wfile.write(b"0\r\n\r\n")
+            except ContextTooLongError as e:
+                # SSE error event carrying the OpenAI-shaped overflow text so
+                # agent CLIs regex-match it and auto-compact + retry
+                sse({"error": {
+                    "message": str(e), "type": "invalid_request_error",
+                    "param": None, "code": "context_length_exceeded"}})
+                self.wfile.write(b"0\r\n\r\n")
             except Exception as e:
                 # Bug 8 principle: a lane-internal error must surface as data,
                 # never as a dead connection the client can only blind-retry.
@@ -719,8 +742,11 @@ class Handler(BaseHTTPRequestHandler):
             except torch.cuda.OutOfMemoryError:
                 self._json(503, {"error": "CUDA OOM: prompt + max_tokens exceed the context pool"})
                 return
-            except AssertionError as e:
-                self._json(400, {"error": f"context pool exceeded: {e}"})
+            except (AssertionError, ContextTooLongError) as e:
+                # OpenAI-standard body; message text is overflow-regex friendly
+                self._json(400, {"error": {
+                    "message": str(e), "type": "invalid_request_error",
+                    "param": None, "code": "context_length_exceeded"}})
                 return
             except Exception as e:
                 # Bug 8 principle: JSON error, never a killed connection
