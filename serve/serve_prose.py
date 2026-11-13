@@ -60,9 +60,9 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
     draft_cache = Cache(draft_model, max_num_tokens=(pool_override or pool), max_history=16, max_batch_size=1,
                         recurrent_dtype=torch.half)
     draft_model.load(progressbar=False, max_batch_size=1, autosplit_no_forward=True,
-                     max_chunk_size=4096)
+                     max_chunk_size=int(os.environ.get("MAXCHUNK", "4096")))
     model.load(draft_model=draft_model, progressbar=False, max_batch_size=1,
-               autosplit_no_forward=True, max_chunk_size=4096)
+               autosplit_no_forward=True, max_chunk_size=int(os.environ.get("MAXCHUNK", "4096")))
     if not draft_cache.initialized:
         draft_model._mark_caches_initialized()
     torch.cuda.empty_cache()
@@ -71,7 +71,7 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
                     num_draft_tokens=window, dynamic_draft_tokens=dynamic,
                     draft_confidence=conf,
                     hybrid_draft_tokens=hdt,
-                    max_chunk_size=4096)
+                    max_chunk_size=int(os.environ.get("MAXCHUNK", "4096")))
     return gen, tokenizer
 
 
@@ -324,6 +324,7 @@ class Server:
         print(f"[serve] loading target {MODEL_DIR}", flush=True)
         t0 = time.time()
         self.gen, self.tokenizer = build_generator(lane, dynamic, conf, window, kv8=kv8, pool_override=pool_override, hdt=hdt)
+        self.pool_tokens = pool_override or LANES[lane][2]
         self.default_window = self.gen.num_draft_tokens
         self.lock = threading.Lock()
         self.eos = [self.tokenizer.eos_token_id, self.tokenizer.single_id("<|im_end|>")]
@@ -475,6 +476,24 @@ class Server:
                              tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings)
+        # Edge guard (crash 2026-11-13): at the physical pool cap the drafter's
+        # eager window-shift round walks past its ring (Xid 13, fault 0xc81eb60,
+        # deterministic at ~160.7k/163840). Never let a sequence reach that
+        # zone: keep a hard margin below the pool, reserve the rescue budget
+        # up front, and clamp max_tokens to what provably fits.
+        EDGE_MARGIN = 4096
+        budget = self.pool_tokens - EDGE_MARGIN
+        n_tok = input_ids.shape[-1]
+        reserve = (THINK_RESCUE_TOKENS + 128) if (think_rescue and enable_thinking) else 128
+        cap = budget - n_tok - reserve
+        if cap < 1:
+            raise AssertionError(
+                f"prompt {n_tok} tokens exceeds usable context {budget} "
+                f"(pool {self.pool_tokens}, edge margin {EDGE_MARGIN})")
+        if max_tokens > cap:
+            print(f"[serve] edge clamp: max_tokens {max_tokens} -> {cap} "
+                  f"(prompt {n_tok}, pool {self.pool_tokens})", flush=True)
+            max_tokens = cap
         sampler = ComboSampler(temperature=temperature, top_p=top_p, top_k=top_k,
                                min_p=min_p)
         min_new = max(0, min(int(min_tokens), max_tokens))
@@ -502,11 +521,21 @@ class Server:
                                                embeddings=embeddings)
             if emit:
                 emit(bridge)
-            out2, dt2, n2, capped, _ = self._gen_pass(
-                input_ids2, THINK_RESCUE_TOKENS, sampler, embeddings, emit)
-            out = cont_prompt + out2  # trimmed think + injected close + answer
-            n = n + n2                # completion tokens summed across passes
-            dt += dt2
+            # re-encoding the streamed text can drift a few tokens past the
+            # reserve computed above; re-check against the edge budget here
+            rescue_cap = min(THINK_RESCUE_TOKENS, budget - input_ids2.shape[-1] - 64)
+            if rescue_cap < 16:
+                print(f"[serve] rescue skipped: no edge budget "
+                      f"(prompt2 {input_ids2.shape[-1]}, budget {budget})", flush=True)
+            else:
+                out2, dt2, n2, capped, _ = self._gen_pass(
+                    input_ids2, rescue_cap, sampler, embeddings, emit)
+                out = cont_prompt + out2  # trimmed think + injected close + answer
+                n = n + n2                # completion tokens summed across passes
+                dt += dt2
+                if rescue_cap < THINK_RESCUE_TOKENS:
+                    capped = True
+                del rescue_cap
         tps = n / dt
         return out, tps, n, capped
 
@@ -670,6 +699,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Bug 8 principle: a lane-internal error must surface as data,
                 # never as a dead connection the client can only blind-retry.
                 print(f"[serve] stream error: {type(e).__name__}: {e}", flush=True)
+                import traceback as _tb; _tb.print_exc(file=__import__("sys").stdout); print(flush=True)
                 try:
                     sse({"error": f"{type(e).__name__}: {e}"})
                     self.wfile.write(b"0\r\n\r\n")
