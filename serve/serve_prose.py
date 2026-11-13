@@ -18,13 +18,21 @@ Alternate lanes:
 Usage:
   CUDA_VISIBLE_DEVICES=0 python serve_prose.py --port 8900
 """
-import argparse, json, os, re, sys, time, threading, uuid
+import argparse, glob, json, os, re, sys, time, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("DSPINE_GRAPH", "1")
 sys.path.insert(0, os.path.expanduser("~/exl3_pipeline/exllamav3"))
 import torch
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ComboSampler
+
+# Harness prefix cache: capture the leading tokens of real requests (the
+# byte-identical system+tools block an agent CLI resends each session) and
+# replay them at boot so the first chat starts warm. Content-hashed, so a
+# harness version bump is just a new hash that re-caches itself.
+PREFIX_CAPTURE_DIR = os.environ.get("DSPINE_PREFIX_CAPTURE_DIR", "")
+PREFIX_CAPTURE_LEN = int(os.environ.get("DSPINE_PREFIX_CAPTURE_LEN", "12288"))
+PREFIX_CAPTURE_MAX = int(os.environ.get("DSPINE_PREFIX_CAPTURE_MAX", "4"))
 
 VISION_ENABLED = True
 try:
@@ -361,6 +369,56 @@ class Server:
               "explanations, so the drafting engine sees many different token patterns."}],
             256, think_rescue=False)
         print(f"[serve] warmup done (shape walk {time.time()-t0:.1f}s)", flush=True)
+        self._replay_prefix_cache()
+
+    # ---------- harness prefix cache (capture + boot warm) ----------
+    # Agent CLIs resend a byte-identical system+tools prefix at the start of
+    # every session. Pages are chained-hash keyed, so the prefix's KV is
+    # content-addressed: a harness version bump simply hashes to new pages and
+    # re-caches on its next first turn. Capturing the leading tokens of real
+    # requests and replaying them at boot makes even the FIRST chat of a fresh
+    # server (or fresh disk) start warm instead of paying a full prefill.
+
+    def _maybe_capture_prefix(self, input_ids):
+        d = PREFIX_CAPTURE_DIR
+        if not d:
+            return
+        try:
+            import hashlib
+            ids = input_ids.flatten()[:PREFIX_CAPTURE_LEN]
+            if len(ids) < 2048:
+                return
+            h = hashlib.sha1(ids.numpy().tobytes()).hexdigest()[:16]
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"{h}.ids")
+            if not os.path.exists(path):
+                ids.numpy().tofile(path)
+                files = sorted(glob.glob(os.path.join(d, "*.ids")), key=os.path.getmtime)
+                for old in files[:-PREFIX_CAPTURE_MAX]:
+                    os.remove(old)
+                print(f"[serve] prefix captured: {h} ({len(ids)} tokens)", flush=True)
+        except Exception as e:
+            print(f"[serve] prefix capture failed: {e}", flush=True)
+
+    def _replay_prefix_cache(self):
+        d = PREFIX_CAPTURE_DIR
+        if not d:
+            return
+        try:
+            import numpy as np
+            files = sorted(glob.glob(os.path.join(d, "*.ids")),
+                           key=os.path.getmtime, reverse=True)[:2]
+            for path in files:
+                ids = torch.from_numpy(np.fromfile(path, dtype=np.int64)).view(1, -1)
+                t0 = time.time()
+                job = Job(input_ids=ids, max_new_tokens=1, stop_conditions=self.eos)
+                self.gen.enqueue(job)
+                while self.gen.num_remaining_jobs():
+                    self.gen.iterate()
+                print(f"[serve] prefix warm: {os.path.basename(path)} "
+                      f"{ids.shape[-1]} tokens in {time.time()-t0:.1f}s", flush=True)
+        except Exception as e:
+            print(f"[serve] prefix warm failed: {e}", flush=True)
 
     # ---------- vision ----------
 
@@ -493,6 +551,7 @@ class Server:
                              tools)
         input_ids = self.tokenizer.encode(prompt, encode_special_tokens=True,
                                           embeddings=embeddings)
+        self._maybe_capture_prefix(input_ids)
         # Edge guard (crash 2026-11-13): at the physical pool cap the drafter's
         # eager window-shift round walks past its ring (Xid 13, fault 0xc81eb60,
         # deterministic at ~160.7k/163840). Never let a sequence reach that
