@@ -9,7 +9,7 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 
 ---
 
-## 0. Current production snapshot (updated 2026-11-13, P3.5)
+## 0. Current production snapshot (updated 2026-11-13, P3.5 + prefill/boot pass)
 
 GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on,
 fused BC GDN kernels inside the verify graph (EXL3_GRAPHS=0, EXL3_GDN_FORCE_TORCH
@@ -29,6 +29,28 @@ multi-turn chat 69.9 t/s avg (+9.7%), VN 54.8 (noise), engine A/B 50.9 to 55.4 t
 (+8.8%). The host-orchestrated candidate dequant (argsort, unique_consecutive,
 per-block python loop) is gone from the round path: one reconstruct_had_blocks
 launch with device-side offsets replaces it. Lossless suite 5/5.
+
+### Prefill pass (same day)
+
+Two findings, both shipped to GPU0:
+
+1. Prefill chunk size 2048 -> 8192 (Generator and model load). First 4k tokens
+   1091 -> 1205 t/s (+10%), 4-16k 1179 -> 1191, long context neutral
+   (626 -> 621 at 65-131k, noise), decode peaks unchanged. 16384-token chunks
+   OOM on 24G in the fp16 weight dequant transient, so 8192 is the ceiling.
+2. Boot shape-walk warmup: the old warmup was one 8-token generation, so every
+   dynamic verify/draft shape paid graph capture on the first real requests.
+   Warmup now runs a 256-token synthetic generation (+2.3s boot). Fresh-server
+   A/B: EN one-shot 60.7 -> 74.1 t/s avg (+22%), first request 54.7 -> 68.0,
+   VN 53.5 -> 55.5, peaks flat.
+
+Prefill anatomy, for the record: short context (<16k) is GEMM-bound (76% of
+kernel time, ~55 TFLOPS effective, near roofline), long context cost is the 16
+full-attention layers growing linearly (53% of a ~95k-context chunk). The Triton
+staged-fp16 attention kernel is at its sm_86 ceiling: online dequant is 2.8x
+slower, 128-row tiles do not fit the 101KB shared memory at head_dim 256, and
+single-slice staging ties the sliced default. The drafter contributes almost
+nothing to prefill (block-level catch-up, 216 ms for 140k tokens).
 
 P2 (fused GDN in graph) vs the P1 stack, measured back to back on one 3090:
 Vietnamese long prose +15.7% (49.0 -> 56.7 t/s; the old -15.2% regression is fully

@@ -33,6 +33,12 @@ verify-pass CUDA graphs. All English prompts, greedy, 2-3 reps, warm server.
 | Structure (strict JSON) | **234.6** | 110 |
 | Math (step-by-step) | **224.7** | 125 |
 
+Prefill: the server ingests prompts in 8192-token chunks (2048 before), which is
++10% on the first 4k tokens (1091 -> 1205 t/s) and neutral at long context.
+Boot warmup walks every dynamic draft/verify shape with one synthetic
+generation, so the first real requests after a restart are warm: fresh-server
+English one-shot 60.7 -> 74.1 t/s (+22%) for +2.3s of startup.
+
 Continuous multi-turn chat gains 5-13% over the same build without graphs, code
 +11%. K8V8 replaced the fp16 cache at equal VRAM: context grew 90k -> 164k tokens
 and every class got faster (+11-14%) because each verify pass reads half the KV
