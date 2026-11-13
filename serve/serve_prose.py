@@ -66,12 +66,29 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
     if not draft_cache.initialized:
         draft_model._mark_caches_initialized()
     torch.cuda.empty_cache()
+    gen_kwargs = {}
+    cpu_gb = float(os.environ.get("DSPINE_CPU_CACHE_GB", "0"))
+    disk_dir = os.environ.get("DSPINE_DISK_CACHE_DIR", "")
+    disk_gb = float(os.environ.get("DSPINE_DISK_CACHE_GB", "64"))
+    if cpu_gb > 0:
+        # Second tier: evicted KV pages live in pinned RAM (LRU, hash-keyed, draft-cache aware),
+        # restored by host-to-device copy instead of re-prefill when a conversation is revisited.
+        gen_kwargs["cpu_cache_size"] = int(cpu_gb * 1024**3)
+        if disk_dir:
+            # Third tier: pages + recurrent checkpoints persisted to disk, survive restarts.
+            gen_kwargs["disk_cache_dir"] = os.path.expanduser(disk_dir)
+            gen_kwargs["disk_cache_size"] = int(disk_gb * 1024**3)
     gen = Generator(model=model, cache=cache, tokenizer=tokenizer,
                     draft_model=draft_model, draft_cache=draft_cache,
                     num_draft_tokens=window, dynamic_draft_tokens=dynamic,
                     draft_confidence=conf,
                     hybrid_draft_tokens=hdt,
-                    max_chunk_size=int(os.environ.get("MAXCHUNK", "4096")))
+                    max_chunk_size=int(os.environ.get("MAXCHUNK", "4096")),
+                    **gen_kwargs)
+    if gen_kwargs:
+        print(f"[serve] cache tiers: RAM {cpu_gb:g}G"
+              + (f" + disk {disk_gb:g}G at {gen_kwargs['disk_cache_dir']}" if disk_dir else ""),
+              flush=True)
     return gen, tokenizer
 
 
