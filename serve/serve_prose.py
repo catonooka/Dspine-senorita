@@ -406,17 +406,28 @@ class Server:
             return
         try:
             import numpy as np
+            # One capture per harness version lands here automatically (omp,
+            # Hermes, Claude Code via a router, anything with a stable opening
+            # prompt). Replay newest-first until the file-count or token budget
+            # is spent, so several tools are all warm at boot.
+            boot_max = int(os.environ.get("DSPINE_PREFIX_BOOT_MAX", "4"))
+            boot_tokens = int(os.environ.get("DSPINE_PREFIX_BOOT_TOKENS", "49152"))
             files = sorted(glob.glob(os.path.join(d, "*.ids")),
-                           key=os.path.getmtime, reverse=True)[:2]
-            for path in files:
+                           key=os.path.getmtime, reverse=True)
+            budget = boot_tokens
+            for path in files[:boot_max]:
                 ids = torch.from_numpy(np.fromfile(path, dtype=np.int64)).view(1, -1)
+                n = ids.shape[-1]
+                if n > budget:
+                    break
+                budget -= n
                 t0 = time.time()
                 job = Job(input_ids=ids, max_new_tokens=1, stop_conditions=self.eos)
                 self.gen.enqueue(job)
                 while self.gen.num_remaining_jobs():
                     self.gen.iterate()
                 print(f"[serve] prefix warm: {os.path.basename(path)} "
-                      f"{ids.shape[-1]} tokens in {time.time()-t0:.1f}s", flush=True)
+                      f"{n} tokens in {time.time()-t0:.1f}s", flush=True)
         except Exception as e:
             print(f"[serve] prefix warm failed: {e}", flush=True)
 
