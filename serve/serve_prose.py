@@ -60,9 +60,9 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
     draft_cache = Cache(draft_model, max_num_tokens=(pool_override or pool), max_history=16, max_batch_size=1,
                         recurrent_dtype=torch.half)
     draft_model.load(progressbar=False, max_batch_size=1, autosplit_no_forward=True,
-                     max_chunk_size=8192)
+                     max_chunk_size=4096)
     model.load(draft_model=draft_model, progressbar=False, max_batch_size=1,
-               autosplit_no_forward=True, max_chunk_size=8192)
+               autosplit_no_forward=True, max_chunk_size=4096)
     if not draft_cache.initialized:
         draft_model._mark_caches_initialized()
     torch.cuda.empty_cache()
@@ -71,7 +71,7 @@ def build_generator(lane, dynamic, conf, window=None, kv8=False, pool_override=N
                     num_draft_tokens=window, dynamic_draft_tokens=dynamic,
                     draft_confidence=conf,
                     hybrid_draft_tokens=hdt,
-                    max_chunk_size=8192)
+                    max_chunk_size=4096)
     return gen, tokenizer
 
 
