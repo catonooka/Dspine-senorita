@@ -332,8 +332,17 @@ class Server:
         print(f"[serve] lane={lane} window={self.gen.num_draft_tokens} (default {self.default_window}) dynamic={dynamic} conf={conf} "
               f"loaded in {time.time()-t0:.0f}s", flush=True)
         # warmup (think_rescue off: keep boot fast, answer completeness irrelevant)
+        # long enough to hit every dynamic verify/draft shape once (graph capture)
         self.generate([{"role": "user", "content": "Say OK."}], 8, think_rescue=False)
-        print("[serve] warmup done", flush=True)
+        t0 = time.time()
+        self.generate(
+            [{"role": "user", "content":
+              "Write a detailed step by step plan for building a small greenhouse. "
+              "Cover materials, tools, budget, timeline, ventilation, watering, and common mistakes. "
+              "Vary sentence lengths naturally as you go, mixing short confirmations with longer "
+              "explanations, so the drafting engine sees many different token patterns."}],
+            256, think_rescue=False)
+        print(f"[serve] warmup done (shape walk {time.time()-t0:.1f}s)", flush=True)
 
     # ---------- vision ----------
 
