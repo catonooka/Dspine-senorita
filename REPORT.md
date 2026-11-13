@@ -9,24 +9,26 @@ single stream, GPU locked (350 W / 1770 MHz / mem 9501) unless labeled projectio
 
 ---
 
-## 0. Current production snapshot (updated 2026-11-13, P3)
+## 0. Current production snapshot (updated 2026-11-13, P3.5)
 
 GPU0, lane dspine, window 8, K8V8 KV cache (163,840-token pool), verify graphs on,
 fused BC GDN kernels inside the verify graph (EXL3_GRAPHS=0, EXL3_GDN_FORCE_TORCH
-unset), and since P3 the whole draft block forward runs as one CUDA graph
-(DSPINE_DRAFT_GRAPH=1). English numbers (greedy, warm server, 2-3 reps, same GPU):
+unset), the draft block forward as one CUDA graph (DSPINE_DRAFT_GRAPH=1), and since
+P3.5 the sample phase rides in the same graph (DSPINE_DRAFT_SAMPLE_GRAPH=1) via a
+new fused block-dequant kernel. English numbers (greedy, warm server, same GPU):
 
 | Workload | Peak t/s | Typical t/s |
 |---|---:|---:|
-| Prose | 90.0 | 59-60 |
-| Code | 138.0 | 110 |
-| Structure (strict JSON) | 213.6 | 106 |
-| Math (step-by-step) | 217.0 | 125 |
+| Prose | 96.4 | 60+ |
+| Code | 147.3 | 110 |
+| Structure (strict JSON) | 234.6 | 110 |
+| Math (step-by-step) | 224.7 | 125 |
 
-P3 (draft graph) vs P2, same 3090 back to back: peaks +4-5% on all four classes,
-EN one-shot prose 63.5 t/s (+2.8%), multi-turn chat 63.7 t/s avg (+5.5%), VN long
-55.6 t/s (noise-level vs 56.7). Draft phase drops 9.5 to 7.0 ms per round. Upstream
-lossless suite 5/5 with draft graphs on.
+P3.5 vs P3, same 3090: peaks +3.5 to +9.8%, EN one-shot prose 68.2 t/s (+7.4%),
+multi-turn chat 69.9 t/s avg (+9.7%), VN 54.8 (noise), engine A/B 50.9 to 55.4 t/s
+(+8.8%). The host-orchestrated candidate dequant (argsort, unique_consecutive,
+per-block python loop) is gone from the round path: one reconstruct_had_blocks
+launch with device-side offsets replaces it. Lossless suite 5/5.
 
 P2 (fused GDN in graph) vs the P1 stack, measured back to back on one 3090:
 Vietnamese long prose +15.7% (49.0 -> 56.7 t/s; the old -15.2% regression is fully

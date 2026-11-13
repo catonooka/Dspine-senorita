@@ -28,10 +28,10 @@ verify-pass CUDA graphs. All English prompts, greedy, 2-3 reps, warm server.
 
 | Workload | Peak t/s (bias-tuned prompt) | Typical t/s (hard prompt) |
 |---|---:|---:|
-| Prose | **90.0** | 59-60 |
-| Code | **138.0** | 110 |
-| Structure (strict JSON) | **213.6** | 106 |
-| Math (step-by-step) | **217.0** | 125 |
+| Prose | **96.4** | 60+ |
+| Code | **147.3** | 110 |
+| Structure (strict JSON) | **234.6** | 110 |
+| Math (step-by-step) | **224.7** | 125 |
 
 Continuous multi-turn chat gains 5-13% over the same build without graphs, code
 +11%. K8V8 replaced the fp16 cache at equal VRAM: context grew 90k -> 164k tokens
@@ -90,7 +90,7 @@ RESEARCH.md  sourced solutions to the four measured blockers (graphs, draft tail
 #     -E CUDA_VISIBLE_DEVICES=0 \
 #     -E DSPINE_GRAPH=1 -E DSPINE_VERIFY_GRAPH=1 \
 #     -E EXL3_GRAPHS=0 -E EXL3_GRAPH_SAFE=1 -E EXL3_BC_ATTN=0 \
-#     -E DSPINE_DRAFT_GRAPH=1 \
+#     -E DSPINE_DRAFT_GRAPH=1 -E DSPINE_DRAFT_SAMPLE_GRAPH=1 \
 #     bash -c 'python serve/serve_prose.py --port 8900 --window 8 \
 #       --kv8 --pool 163840 > server.log 2>&1'
 # drop the five -E env vars and the --kv8 --pool flags for the no-graphs fp16 build
