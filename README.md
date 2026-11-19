@@ -2,8 +2,10 @@
 
 By **catonooka**: [X / Twitter](https://x.com/catonooka) -
 [GitHub](https://github.com/catonooka) -
-[Hugging Face](https://huggingface.co/catonooka) (target quant:
-[Qwen3.8-27B-EXL3-4.0bpw-h8](https://huggingface.co/catonooka/Qwen3.8-27B-EXL3-4.0bpw-h8)).
+[Hugging Face](https://huggingface.co/catonooka) (target quant, abliterated build:
+[Qwen3.8-27B-Heretic-Abliterated-EXL3-4.0bpw-h8](https://huggingface.co/catonooka/Qwen3.8-27B-Heretic-Abliterated-EXL3-4.0bpw-h8),
+bf16 source:
+[Qwen3.8-27B-Heretic-Abliterated](https://huggingface.co/catonooka/Qwen3.8-27B-Heretic-Abliterated)).
 
 Creative-prose and code decode speed for **Qwen3.8-27B EXL3 4.0bpw-h8 on a single
 RTX 3090**, drafted with **DSpine** (Tencent's parallel 5-layer drafter) - a full
@@ -59,6 +61,23 @@ number under ~150 t/s code / ~65 t/s prose is inside the band.
 sub-30 ms rounds; 120 t/s prose needs 5+ committed, which no drafter we tested
 reaches on high-entropy creative text. Details and the remaining levers are in
 [REPORT.md](REPORT.md).
+
+## Abliterated target build (2026-11-19)
+
+The target pack is now the **Heretic-abliterated** build (98/100 stock refusals -> 3/100,
+KL 1.70, benign quality verified; see the HF cards). Same quant recipe as the stock pack
+(bits 4.0, h8, mul1, hessians_reg 0.025, cal 250x2048, mtp_bits 4); conversion 42 min
+on 4x3090. Two measured consequences for the drafting lane:
+
+1. **DSpine drafter needs NO retraining.** Acceptance with the stock-pretrained drafter
+   did not drop; story_think rose 19.15 -> 26.01% @ndt7, code_think hit 73.0% @ndt7
+   (121.6 t/s single-card, 155.2 t/s @ndt15). The retrain gate never triggered.
+2. **Control thinking via the chat template only.** The abliterated build is
+   thinking-addicted: hard-banning `<think>` in a raw prompt makes it emit `<|im_end|>`
+   instantly. Template kwargs are clean at all four levels: xhigh 383 think-words,
+   medium 79, low 57, off 0 (zero leakage).
+
+Full matrix and campaign log in [REPORT.md](REPORT.md), Era 2.
 
 ## Measured and rejected
 

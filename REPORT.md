@@ -597,3 +597,47 @@ Typical harder prompts (rich creative prose / full modules / large varied JSON /
 multi-part derivations): prose 59-60, code 110, structure 106, math 125.
 Peaks approach the acceptance ceiling of window 8; further headroom = P2
 (capture-safe fused GDN removes FORCE_TORCH), P3 (draft-phase graphs), P4 (trees).
+
+## Era 2 - Abliterated target build (2026-11-19)
+
+Target swapped: stock Qwen3.8-27B -> Heretic-abliterated build (ARA, 100-trial Optuna,
+selected trial = 3/100 refusals at KL 1.70; the 0-refusal KL-11 twin degraded to
+single-token spam and was discarded: past KL ~2 on this arch is a quality cliff, not a
+tradeoff). Published as catonooka/Qwen3.8-27B-Heretic-Abliterated (bf16, MTP restored
+from stock after the HF round-trip dropped the 15 mtp.* tensors) and
+catonooka/Qwen3.8-27B-Heretic-Abliterated-EXL3-4.0bpw-h8 (this pack).
+
+Quant: identical recipe to Era 1 (bits 4.0, head_bits 8, embed_bits 16, mul1,
+hessians_reg 0.025, cal 250x2048, mtp_bits 4, shard 8192). 4x3090 wall clock 42 min,
+672 modules, 16 GB pack.
+
+### Acceptance matrix, stock-pretrained DSpine drafter (EXL3 5.0bpw-h8), GPU1, greedy 220 tok
+
+| config | accept % | committed/round | t/s | stock-pack baseline |
+|---|---:|---:|---:|---:|
+| story think ndt7 | 26.01 | 2.82 | 57.9 | 19.15 % |
+| story think ndt15 | 10.19 | 2.53 | 47.1 | - |
+| code think ndt7 | 73.02 | 6.11 | 121.6 | - |
+| code think ndt15 | 47.65 | 8.15 | 155.2 | - |
+
+Verdict: ablation did NOT hurt draft acceptance (story think +6.9 pp vs stock pack).
+Retrain gate failed to trigger; the Tencent-pretrained drafter carries over unchanged.
+
+### no-think probe anomaly, resolved
+
+First probe run: no-think lanes stopped at 4-29 tokens and looked broken. Root cause:
+the harness suppressed thinking by hard-banning the `<think>` token; the abliterated
+build assigns so much mass to opening `<think>` that with it banned the argmax walks
+straight into `<|im_end|>`. Without the ban it opens `<think>` and reasons normally.
+Rule: on abliterated builds, switch thinking off via the chat template
+(enable_thinking: false) or scale it with reasoning_effort; never banned_strings.
+
+Thinking matrix (same lighthouse prompt, temp 0, tp=4 vLLM, bf16):
+- xhigh: 700 tok (length-capped), 383 think-words, prose flowing
+- medium: 457 tok, 79 think-words, finish stop
+- low: 343 tok, 57 think-words, finish stop
+- off: 250 tok, 0 think-words, no leakage, clean prose
+
+Era 1 speeds (P3.5 graphs + K8V8 production stack) are expected to carry over; the
+acceptance ceiling analysis is unchanged since committed/round improved on the one
+comparable lane.
